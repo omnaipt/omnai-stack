@@ -1,0 +1,70 @@
+{
+  "_meta": {
+    "generated_at": "2026-05-01",
+    "source": "Sprint 4 seed, Notion DB id 6e8290fd-b8a8-4232-a0ff-50bc2961a620",
+    "ttl_seconds": 3600,
+    "note": "Fallback usado por load_inquilinos_from_notion quando a query Notion falha. Estado em 01-05-2026."
+  },
+  "inquilinos": [
+    {
+      "notion_id": null,
+      "nome": "Fernanda Mendonca",
+      "fraccao": "Fracao A",
+      "email": null,
+      "telefone": null,
+      "renda_mensal": 600.0,
+      "inicio_contrato": null,
+      "fim_contrato": null,
+      "status": "Activo",
+      "notas": "Confirmado 01-05-2026"
+    },
+    {
+      "notion_id": null,
+      "nome": "Tiago Antunes",
+      "fraccao": "Fracao B",
+      "email": "tiago.m.s.antunes@gmail.com",
+      "telefone": null,
+      "renda_mensal": 500.0,
+      "inicio_contrato": null,
+      "fim_contrato": null,
+      "status": "Activo",
+      "notas": "Confirmado 01-05-2026"
+    },
+    {
+      "notion_id": null,
+      "nome": "Acopancas",
+      "fraccao": "Fracao C",
+      "email": "acopankas@sapo.pt",
+      "telefone": null,
+      "renda_mensal": 1200.0,
+      "inicio_contrato": null,
+      "fim_contrato": null,
+      "status": "Activo",
+      "notas": "Historico critico Aco Pankas"
+    },
+    {
+      "notion_id": null,
+      "nome": "Nectaprova",
+      "fraccao": "Fracao D1",
+      "email": null,
+      "telefone": null,
+      "renda_mensal": 700.0,
+      "inicio_contrato": null,
+      "fim_contrato": null,
+      "status": "Activo",
+      "notas": "Confirmado 01-05-2026"
+    },
+    {
+      "notion_id": null,
+      "nome": "Ricardo Rocha",
+      "fraccao": "Fracao D",
+      "email": null,
+      "telefone": null,
+      "renda_mensal": 500.0,
+      "inicio_contrato": null,
+      "fim_contrato": null,
+      "status": "Activo",
+      "notas": "Pagamento em dinheiro, sem fatura por opcao do David"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "_comment": "Lista de bancos por empresa. Usada pelo worker alerta-extractos-bancarios-dia3 para compor o email lembrete ao David. Deve ser revista e completada conforme vao sendo abertas ou fechadas contas.",
+  "OMNAI": [
+    {"banco": "Millennium BCP", "conta": "empresa", "obs": "conta principal operacional"},
+    {"banco": "Revolut Business", "conta": "multi-moeda", "obs": "pagamentos internacionais"}
+  ],
+  "Previnsa": [
+    {"banco": "Millennium BCP", "conta": "empresa", "obs": "principal"},
+    {"banco": "Caixa Geral de Depositos", "conta": "DO", "obs": "salarios + pagamentos SEPA"}
+  ],
+  "JMSoares": [
+    {"banco": "Caixa Geral de Depositos", "conta": "DO", "obs": "conta principal"}
+  ],
+  "Sopato": [
+    {"banco": "Millennium BCP", "conta": "DO", "obs": "rendas e despesas do predio"}
+  ]
+}

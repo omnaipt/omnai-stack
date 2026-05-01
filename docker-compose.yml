@@ -1,0 +1,95 @@
+name: omnai-stack
+
+# Versao Hostinger-ready: Traefik e n8n ja existem no VPS, nao duplicamos.
+# O agents-api expoe-se em 127.0.0.1:8010 e a rota Traefik esta em
+# /etc/traefik/dynamic.yml (Host agents.omnai.pt -> localhost:8010).
+
+networks:
+  omnai_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  agents_data:
+
+  uptime_kuma_data:
+services:
+  # Base de dados propria do OMNAI (isolada do despesas-db)
+  postgres:
+    image: postgres:16-alpine
+    container_name: omnai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [omnai_net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Cache e filas (Redis partilhado entre workers)
+  redis:
+    image: redis:7-alpine
+    container_name: omnai_redis
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    networks: [omnai_net]
+
+  # Hub dos agentes (FastAPI)
+  agents-api:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile
+    container_name: omnai_agents
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-6}
+      NOTION_TOKEN: ${NOTION_TOKEN}
+      NOTION_VERSION: ${NOTION_VERSION:-2022-06-28}
+      OMNAI_API_TOKEN: ${OMNAI_API_TOKEN}
+      SECRETS_DIR: /secrets
+      FATURAS_DIR: /faturas
+      DRIVE_ENABLED: ${DRIVE_ENABLED:-true}
+      DRIVE_ROOT_FOLDER: ${DRIVE_ROOT_FOLDER:-Faturas OMNAI}
+      SCAN_MODE: ${SCAN_MODE:-balanced}
+      SCAN_DRY_RUN: ${SCAN_DRY_RUN:-false}
+      SCAN_CAP: ${SCAN_CAP:-50}
+      TZ: Europe/Lisbon
+    volumes:
+      - ./agents:/app
+      - ./schedules:/app/schedules:ro
+      - ./secrets:/secrets:rw
+      - ./faturas:/faturas:rw
+      - agents_data:/var/lib/omnai
+    ports:
+      - "127.0.0.1:8010:8000"
+    networks: [omnai_net]
+
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: omnai_uptime_kuma
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - uptime_kuma_data:/app/data
+    environment:
+      - TZ=Europe/Lisbon
+    networks: [omnai_net]
+

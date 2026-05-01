@@ -1,0 +1,45 @@
+# Sprint 6: .gitignore para o stack OMNAI
+
+# Secrets
+.env
+.env.*
+!.env.example
+!.env.sprint*.example
+secrets/
+*.key
+*.pem
+credentials*.json
+
+# Faturas e dados sensiveis
+faturas/
+/var/lib/omnai/
+
+# Backups
+*.bak.*
+*.sprint*.bak.*
+*.v9*bak*
+*.pre-*.*
+_backup_*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Docker volumes (montados em host paths)
+postgres_data/
+redis_data/
+uptime_kuma_data/
+
+# Logs
+*.log
+logs/

@@ -1,0 +1,227 @@
+[
+  {
+    "taskId": "email-scan",
+    "description": "Scan matinal: gmail-multi-mcp + classificação + arquivo + briefing Notion (página persistente com checkboxes)",
+    "schedule": "At 07:54 AM, Monday through Friday",
+    "cronExpression": "45 7 * * 1-5",
+    "timezone": "Europe/Lisbon",
+    "owner": "carlos",
+    "enabled": true
+  },
+  {
+    "taskId": "briefing-carlos",
+    "description": "Briefing Carlos: gmail-multi-mcp + calendário + Notion + arquivo automático + download faturas Drive",
+    "schedule": "At 08:18 AM, Monday through Friday",
+    "cronExpression": "15 8 * * 1-5",
+    "timezone": "Europe/Lisbon",
+    "owner": "carlos",
+    "enabled": true
+  },
+  {
+    "taskId": "scan-concursos-publicos",
+    "description": "Scan diário de concursos públicos relevantes para Previnsa (segurança) e JMSoares (construção) via BASE.gov.pt",
+    "schedule": "At 10:08 AM, Monday through Friday",
+    "cronExpression": "0 10 * * 1-5",
+    "timezone": "Europe/Lisbon",
+    "owner": "beatriz",
+    "enabled": true
+  },
+  {
+    "taskId": "jmsoares-concursos-seguranca",
+    "description": "Pesquisa diária de concursos de segurança para JMSoares via DRE/dre.tretas.org. Actualiza base de dados no Notion",
+    "schedule": "At 12:06 PM, every day",
+    "cronExpression": "0 12 * * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "tiago",
+    "enabled": true
+  },
+  {
+    "taskId": "email-check-midday",
+    "description": "Check meio-dia: gmail-multi-mcp + arquivo + actualização briefing Notion (acumula com pendentes)",
+    "schedule": "At 01:07 PM, Monday through Friday",
+    "cronExpression": "0 13 * * 1-5",
+    "timezone": "Europe/Lisbon",
+    "owner": "carlos",
+    "enabled": true
+  },
+  {
+    "taskId": "email-fecho-dia",
+    "description": "Fecho do dia: gmail-multi-mcp + arquivo completo + briefing Notion final + plano amanhã",
+    "schedule": "At 06:09 PM, Monday through Friday",
+    "cronExpression": "0 18 * * 1-5",
+    "timezone": "Europe/Lisbon",
+    "owner": "carlos",
+    "enabled": true
+  },
+  {
+    "taskId": "analise-concorrencia-semanal",
+    "description": "Análise semanal de concorrência para OMNAI, Previnsa e JMSoares. Pesquisa novidades, actualiza Notion e reporta ao David",
+    "schedule": "At 09:01 AM, only on Monday",
+    "cronExpression": "0 9 * * 1",
+    "timezone": "Europe/Lisbon",
+    "owner": "rita",
+    "enabled": true
+  },
+  {
+    "taskId": "pipeline-review-semanal",
+    "description": "Review semanal do pipeline comercial pelo Tiago (Sales): deals activos, follow-ups pendentes, forecast",
+    "schedule": "At 09:04 AM, only on Monday",
+    "cronExpression": "0 9 * * 1",
+    "timezone": "Europe/Lisbon",
+    "owner": "tiago",
+    "enabled": true
+  },
+  {
+    "taskId": "check-deadlines-legais",
+    "description": "Verificação semanal de deadlines legais pela Beatriz (Legal): contratos a expirar, certidões a renovar, obrigações",
+    "schedule": "At 10:09 AM, only on Wednesday",
+    "cronExpression": "0 10 * * 3",
+    "timezone": "Europe/Lisbon",
+    "owner": "beatriz",
+    "enabled": true
+  },
+  {
+    "taskId": "arquivo-faturas",
+    "description": "Varredura semanal de faturas via gmail-multi-mcp: todas as contas, compara com Excel, download para Google Drive",
+    "schedule": "At 08:01 PM, only on Sunday",
+    "cronExpression": "0 20 * * 0",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": true
+  },
+  {
+    "taskId": "alerta-fecho-contabilistico-dia1",
+    "description": "Alerta da Ana (CFO): início do ciclo de fecho contabilístico no dia 1 de cada mês",
+    "schedule": "At 09:00 AM, on day 1 of the month",
+    "cronExpression": "0 9 1 * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": true
+  },
+  {
+    "taskId": "alerta-extractos-bancarios-dia3",
+    "description": "Alerta da Ana (CFO): solicitar extractos bancários a David no dia 3 de cada mês",
+    "schedule": "At 09:00 AM, on day 3 of the month",
+    "cronExpression": "0 9 3 * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": true
+  },
+  {
+    "taskId": "verificacao-recibos-sopato",
+    "description": "Verificação mensal de recibos de renda da Sopato pela Ana (CFO). Previne incidentes como o de João Cândido",
+    "schedule": "At 10:00 AM, on day 5 of the month",
+    "cronExpression": "0 10 5 * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": true
+  },
+  {
+    "taskId": "alerta-deadline-contabilidade-dia9",
+    "description": "Alerta da Ana (CFO): pacote contabilístico deve ser enviado amanhã (dia 10). Verificação final",
+    "schedule": "At 09:00 AM, on day 9 of the month",
+    "cronExpression": "0 9 9 * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": true
+  },
+  {
+    "taskId": "inbox-sweep-morning",
+    "description": "Sweep matinal consolidado (email-scan + briefing-carlos)",
+    "schedule": "At 08:00, Monday-Friday",
+    "cronExpression": "0 8 * * 1-5",
+    "timezone": "Europe/Lisbon",
+    "owner": "carlos",
+    "enabled": true
+  },
+  {
+    "taskId": "inbox-sweep-midday",
+    "description": "Sweep meio-dia: refresh inbox + actualiza briefing persistente",
+    "schedule": "At 13:00, Monday-Friday",
+    "cronExpression": "0 13 * * 1-5",
+    "timezone": "Europe/Lisbon",
+    "owner": "carlos",
+    "enabled": true
+  },
+  {
+    "taskId": "inbox-sweep-evening",
+    "description": "Sweep fecho do dia: scan final + plano amanha (V2)",
+    "schedule": "At 18:00, Monday-Friday",
+    "cronExpression": "0 18 * * 1-5",
+    "timezone": "Europe/Lisbon",
+    "owner": "carlos",
+    "enabled": true
+  },
+  {
+    "taskId": "ciclo-fecho-dia1",
+    "description": "Ciclo fecho contabilistico - dia 1: abertura",
+    "schedule": "At 09:00, on day 1 of the month",
+    "cronExpression": "0 9 1 * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": false
+  },
+  {
+    "taskId": "ciclo-fecho-dia3",
+    "description": "Ciclo fecho contabilistico - dia 3: lembrete extractos bancarios",
+    "schedule": "At 09:00, on day 3 of the month",
+    "cronExpression": "0 9 3 * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": false
+  },
+  {
+    "taskId": "ciclo-fecho-dia9",
+    "description": "Ciclo fecho contabilistico - dia 9: deadline amanha",
+    "schedule": "At 09:00, on day 9 of the month",
+    "cronExpression": "0 9 9 * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": false
+  },
+  {
+    "taskId": "learn-from-sapo-trash",
+    "description": "Aprende com pasta Lixo/Trash das contas IMAP nos ultimos 7 dias",
+    "schedule": "At 19:00, only on Sunday",
+    "cronExpression": "0 19 * * 0",
+    "timezone": "Europe/Lisbon",
+    "owner": "carlos",
+    "enabled": true
+  },
+  {
+    "taskId": "backup-postgres-diario",
+    "description": "Sprint 6: pg_dump diario da DB OMNAI, gzip, push para Cloudflare R2 (rclone), prune >30d",
+    "schedule": "Daily at 03:00 UTC",
+    "cronExpression": "0 3 * * *",
+    "timezone": "UTC",
+    "owner": "marco",
+    "enabled": true
+  },
+  {
+    "taskId": "sofia-daily-product-pulse",
+    "description": "Sprint 6: Sofia varre Backlog Produto, sinaliza P0 abertos e Sprint sem numero, gera card-resumo diario",
+    "schedule": "At 07:50, Monday-Friday",
+    "cronExpression": "50 7 * * 1-5",
+    "timezone": "Europe/Lisbon",
+    "owner": "sofia",
+    "enabled": true
+  },
+  {
+    "taskId": "marco-health-check-all",
+    "description": "Sprint 6: health checks Postgres, Redis, disco, memoria, scheduler. De 15 em 15min. Card P0 quando algo cai",
+    "schedule": "Every 15 minutes",
+    "cronExpression": "*/15 * * * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "marco",
+    "enabled": true
+  },
+  {
+    "taskId": "cleanup-briefing-items",
+    "description": "Sprint 6: cleanup mensal briefing_items >90d (status done/dismissed). Dump+push R2 antes de DELETE",
+    "schedule": "Monthly day 1 at 04:00 UTC",
+    "cronExpression": "0 4 1 * *",
+    "timezone": "UTC",
+    "owner": "marco",
+    "enabled": true
+  }
+]

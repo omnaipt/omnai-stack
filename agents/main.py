@@ -1,0 +1,271 @@
+"""OMNAI Agents API v0.2.1 - com worker learn_from_sapo_trash registado."""
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import structlog
+from fastapi import Depends, FastAPI, HTTPException, Request
+from pydantic import BaseModel
+
+from auth import require_token
+
+from workers import (
+    briefing_carlos,
+    briefing_inbox,
+    email_scan,
+    verificacao_recibos_sopato,
+    alerta_fecho_contabilistico_dia1,
+    alerta_extractos_bancarios_dia3,
+    alerta_deadline_contabilidade_dia9,
+    arquivo_faturas,
+    check_deadlines_legais,
+    pipeline_review_semanal,
+    analise_concorrencia_semanal,
+    scan_concursos_publicos,
+    inbox_sweep,
+    ciclo_fecho_contabilistico,
+    learn_from_sapo_trash,
+    backup_postgres_diario,
+    sofia_daily_product_pulse,
+    marco_health_check_all,
+    cleanup_briefing_items,
+)
+
+log = structlog.get_logger()
+
+SCHEDULES_FILE = Path(os.getenv("SCHEDULES_FILE", "/app/schedules/schedules.json"))
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+
+def load_schedules() -> list[dict[str, Any]]:
+    if not SCHEDULES_FILE.exists():
+        log.warning("schedules.json nao encontrado", path=str(SCHEDULES_FILE))
+        return []
+    return json.loads(SCHEDULES_FILE.read_text(encoding="utf-8"))
+
+
+SCHEDULES: list[dict[str, Any]] = load_schedules()
+
+AGENTS = {
+    "ana":     {"role": "CFO",             "areas": ["financas", "contabilidade"]},
+    "marco":   {"role": "Tech Lead",       "areas": ["backend", "infra", "apis"]},
+    "sofia":   {"role": "Product Owner",   "areas": ["backlog", "roadmap"]},
+    "ze":      {"role": "Design Engineer", "areas": ["ux", "frontend", "mobile"]},
+    "rita":    {"role": "Marketing Lead",  "areas": ["conteudo", "seo", "redes"]},
+    "tiago":   {"role": "Sales",           "areas": ["crm", "pipeline"]},
+    "beatriz": {"role": "Legal",           "areas": ["contratos", "rgpd"]},
+    "carlos":  {"role": "Dispatcher",      "areas": ["routing", "briefings"]},
+}
+
+WORKERS = {
+    "briefing-carlos": briefing_inbox.run,  # v9.2 substitui o worker antigo
+    "email-scan": email_scan.run,
+    "verificacao-recibos-sopato": verificacao_recibos_sopato.run,
+    "alerta-fecho-contabilistico-dia1": alerta_fecho_contabilistico_dia1.run,
+    "alerta-extractos-bancarios-dia3": alerta_extractos_bancarios_dia3.run,
+    "alerta-deadline-contabilidade-dia9": alerta_deadline_contabilidade_dia9.run,
+    "arquivo-faturas": arquivo_faturas.run,
+    "check-deadlines-legais": check_deadlines_legais.run,
+    "pipeline-review-semanal": pipeline_review_semanal.run,
+    "analise-concorrencia-semanal": analise_concorrencia_semanal.run,
+    "scan-concursos-publicos": scan_concursos_publicos.run,
+    "inbox-sweep-morning": inbox_sweep.run_morning,
+    "inbox-sweep-midday": inbox_sweep.run_midday,
+    "inbox-sweep-evening": inbox_sweep.run_evening,
+    "ciclo-fecho-dia1": ciclo_fecho_contabilistico.run_open,
+    "ciclo-fecho-dia3": ciclo_fecho_contabilistico.run_extractos,
+    "ciclo-fecho-dia9": ciclo_fecho_contabilistico.run_deadline,
+    "learn-from-sapo-trash": learn_from_sapo_trash.run,
+    "backup-postgres-diario": backup_postgres_diario.run,
+    "sofia-daily-product-pulse": sofia_daily_product_pulse.run,
+    "marco-health-check-all": marco_health_check_all.run,
+    "cleanup-briefing-items": cleanup_briefing_items.run,
+}
+
+from contextlib import asynccontextmanager
+
+from services import scheduler as native_scheduler
+
+
+@asynccontextmanager
+async def lifespan(app):
+    log.info("lifespan.start scheduler arrancar")
+    native_scheduler.start(WORKERS)
+    yield
+    log.info("lifespan.stop scheduler a parar")
+    native_scheduler.stop()
+
+
+app = FastAPI(title="OMNAI Agents API", version="0.3.0", lifespan=lifespan)
+
+
+class DispatchPayload(BaseModel):
+    source: str
+    payload: dict[str, Any]
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    """Endpoint publico, sem auth, para healthchecks."""
+    return {
+        "status": "ok",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "version": "0.2.1",
+        "model": ANTHROPIC_MODEL,
+        "schedules_loaded": len(SCHEDULES),
+        "agents": list(AGENTS.keys()),
+        "workers_implemented": sorted(WORKERS.keys()),
+        "auth_required": True,
+    }
+
+
+@app.get("/agents", dependencies=[Depends(require_token)])
+def list_agents() -> dict[str, Any]:
+    return {"agents": AGENTS}
+
+
+@app.get("/tasks", dependencies=[Depends(require_token)])
+def list_tasks() -> dict[str, Any]:
+    return {"count": len(SCHEDULES), "tasks": SCHEDULES}
+
+
+@app.post("/tasks/run/{task_id}", dependencies=[Depends(require_token)])
+async def run_task(task_id: str, request: Request) -> dict[str, Any]:
+    task = next((t for t in SCHEDULES if t["taskId"] == task_id), None)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"task '{task_id}' nao encontrada")
+
+    log.info("task.run.start", task_id=task_id, description=task.get("description"))
+
+    worker = WORKERS.get(task_id)
+    if worker:
+        try:
+            result = await worker()
+            log.info("task.run.done", task_id=task_id, result_status=result.get("status"))
+            return {
+                "status": "completed",
+                "task_id": task_id,
+                "worker_module": worker.__module__,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "result": result,
+            }
+        except Exception as exc:
+            log.exception("task.run.error", task_id=task_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"worker error: {type(exc).__name__}: {exc}",
+            )
+
+    return {
+        "status": "accepted",
+        "task_id": task_id,
+        "description": task.get("description"),
+        "worker": "stub",
+        "note": "Sem worker implementado para este task_id ainda.",
+    }
+
+
+@app.post("/dispatch", dependencies=[Depends(require_token)])
+def dispatch(payload: DispatchPayload) -> dict[str, Any]:
+    log.info("dispatch.received", source=payload.source)
+    return {
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "routed_to": "carlos",
+        "source": payload.source,
+    }
+
+
+# ====== v9.2 actions endpoints ======
+from fastapi.responses import HTMLResponse  # noqa: E402
+
+from services import briefing_db  # noqa: E402
+from services.action_tokens import verify_token  # noqa: E402
+
+
+def _action_html(emoji: str, titulo: str, sub: str = "") -> str:
+    return f"""<!DOCTYPE html>
+<html lang="pt"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{titulo}</title>
+<style>
+body{{font-family:system-ui;-webkit-font-smoothing:antialiased;
+     display:flex;align-items:center;justify-content:center;
+     min-height:100vh;margin:0;background:#fafafa;color:#111}}
+.box{{background:#fff;padding:40px;border-radius:12px;
+     box-shadow:0 1px 3px rgba(0,0,0,0.08);text-align:center;max-width:420px}}
+.emoji{{font-size:48px;margin-bottom:16px}}
+h1{{margin:0 0 8px;font-size:22px}}
+p{{margin:0;color:#555}}
+</style></head>
+<body><div class="box">
+<div class="emoji">{emoji}</div>
+<h1>{titulo}</h1>
+<p>{sub}</p>
+</div></body></html>"""
+
+# ====== v9.2.1 actions endpoints (auto-refresh + redirect ao Notion) ======
+NOTION_BRIEFING_URL = "https://www.notion.so/33e973b9238781078667eadc9128ab27"
+
+
+@app.get("/actions/done")
+async def action_done(id: str, t: str, d: int = 0):
+    from fastapi.responses import RedirectResponse
+    from workers import briefing_inbox
+
+    ok, _ = verify_token(id, "done", t)
+    if not ok:
+        return _action_html("Token invalido", "Esse link expirou ou foi alterado.")
+
+    await briefing_db.mark_done(id)
+    try:
+        await briefing_inbox.run()
+    except Exception as exc:
+        log.warning("briefing_inbox refresh FAIL", err=str(exc))
+
+    return RedirectResponse(url=NOTION_BRIEFING_URL, status_code=302)
+
+
+@app.get("/actions/snooze")
+async def action_snooze(id: str, t: str, d: int = 7):
+    from fastapi.responses import RedirectResponse
+    from workers import briefing_inbox
+
+    ok, days = verify_token(id, "snooze", t)
+    if not ok:
+        return _action_html("Token invalido", "Esse link expirou ou foi alterado.")
+
+    days = max(1, min(60, days or d))
+    await briefing_db.snooze(id, days=days)
+    try:
+        await briefing_inbox.run()
+    except Exception as exc:
+        log.warning("briefing_inbox refresh FAIL", err=str(exc))
+
+    return RedirectResponse(url=NOTION_BRIEFING_URL, status_code=302)
+
+
+@app.get("/actions/dismiss")
+async def action_dismiss(id: str, t: str):
+    from fastapi.responses import RedirectResponse
+    from workers import briefing_inbox
+
+    ok, _ = verify_token(id, "dismiss", t)
+    if not ok:
+        return _action_html("Token invalido", "")
+
+    await briefing_db.mark_dismissed(id)
+    try:
+        await briefing_inbox.run()
+    except Exception as exc:
+        log.warning("briefing_inbox refresh FAIL", err=str(exc))
+
+    return RedirectResponse(url=NOTION_BRIEFING_URL, status_code=302)
+
+
+@app.get("/scheduler/jobs", dependencies=[Depends(require_token)])
+def scheduler_jobs() -> dict:
+    return {"jobs": native_scheduler.get_jobs()}

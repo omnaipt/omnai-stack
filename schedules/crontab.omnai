@@ -1,0 +1,53 @@
+# /etc/cron.d/omnai
+# Fallback host-level cron que dispara tasks via agents-api caso o n8n esteja indisponivel.
+# Timezone do VPS deve estar em Europe/Lisbon (o bootstrap.sh nao altera TZ, verificar com `timedatectl`).
+# Instalar: sudo cp schedules/crontab.omnai /etc/cron.d/omnai && sudo chmod 644 /etc/cron.d/omnai
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+
+# Helper: curl POST para o endpoint interno do agents-api
+# (assume Caddy a expor agents.omnai.pt; usa Basic Auth se adicionares)
+
+# email-scan                         - Seg-Sex 07:54
+45 7  * * 1-5  omnai curl -fsS -X POST http://localhost/tasks/run/email-scan -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# briefing-carlos                    - Seg-Sex 08:18
+15 8  * * 1-5  omnai curl -fsS -X POST http://localhost/tasks/run/briefing-carlos -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# scan-concursos-publicos            - Seg-Sex 10:08
+0  10 * * 1-5  omnai curl -fsS -X POST http://localhost/tasks/run/scan-concursos-publicos -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# jmsoares-concursos-seguranca       - diario 12:06
+0  12 * * *    omnai curl -fsS -X POST http://localhost/tasks/run/jmsoares-concursos-seguranca -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# email-check-midday                 - Seg-Sex 13:07
+0  13 * * 1-5  omnai curl -fsS -X POST http://localhost/tasks/run/email-check-midday -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# email-fecho-dia                    - Seg-Sex 18:09
+0  18 * * 1-5  omnai curl -fsS -X POST http://localhost/tasks/run/email-fecho-dia -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# analise-concorrencia-semanal       - Seg 09:01
+0  9  * * 1    omnai curl -fsS -X POST http://localhost/tasks/run/analise-concorrencia-semanal -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# pipeline-review-semanal            - Seg 09:04
+0  9  * * 1    omnai curl -fsS -X POST http://localhost/tasks/run/pipeline-review-semanal -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# check-deadlines-legais             - Qua 10:09
+0  10 * * 3    omnai curl -fsS -X POST http://localhost/tasks/run/check-deadlines-legais -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# arquivo-faturas                    - Dom 20:01
+0  20 * * 0    omnai curl -fsS -X POST http://localhost/tasks/run/arquivo-faturas -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# alerta-fecho-contabilistico-dia1   - dia 1 09:00
+0  9  1 * *    omnai curl -fsS -X POST http://localhost/tasks/run/alerta-fecho-contabilistico-dia1 -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# alerta-extractos-bancarios-dia3    - dia 3 09:00
+0  9  3 * *    omnai curl -fsS -X POST http://localhost/tasks/run/alerta-extractos-bancarios-dia3 -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# verificacao-recibos-sopato         - dia 5 10:00
+0  10 5 * *    omnai curl -fsS -X POST http://localhost/tasks/run/verificacao-recibos-sopato -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+
+# alerta-deadline-contabilidade-dia9 - dia 9 09:00
+0  9  9 * *    omnai curl -fsS -X POST http://localhost/tasks/run/alerta-deadline-contabilidade-dia9 -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
