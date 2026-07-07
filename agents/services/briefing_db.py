@@ -1,6 +1,8 @@
 """Acesso a tabela briefing_items (Postgres).
 
 v9.2.1: nova funcao list_recently_resolved para mostrar 'Resolvido hoje'.
+v9.8.1: expire_overdue_concursos + escalate_concursos_by_prazo
+        (briefing accionavel: auto-expiracao e escalacao por prazo).
 """
 from __future__ import annotations
 
@@ -149,6 +151,61 @@ async def list_recently_resolved(hours: int = 24, limit: int = 50) -> list[dict]
             limit,
         )
         return [dict(r) for r in rows]
+
+
+async def expire_overdue_concursos() -> int:
+    """Dismiss automatico de concursos cujo prazo de propostas ja passou.
+
+    Marca status='dismissed' + resolvido_em=NOW() e regista
+    metadata.auto_expired=true para telemetria. So considera valores de
+    metadata->>'prazo_propostas' em formato ISO (YYYY-MM-DD); valores
+    como 'sem prazo' sao ignorados. COALESCE protege metadata NULL.
+
+    Devolve o numero de linhas expiradas. Chamado diariamente pelo
+    briefing-inbox ANTES de list_open (e antes de escalate_concursos_by_prazo).
+    """
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE briefing_items
+               SET status = 'dismissed', resolvido_em = NOW(),
+                   metadata = COALESCE(metadata, '{}'::jsonb) || '{"auto_expired": true}'::jsonb
+             WHERE tipo = 'concurso_novo'
+               AND status IN ('open', 'snoozed')
+               AND metadata->>'prazo_propostas' ~ '^\\d{4}-\\d{2}-\\d{2}$'
+               AND (metadata->>'prazo_propostas')::date < CURRENT_DATE
+            """
+        )
+        return int(result.split()[-1])
+
+
+async def escalate_concursos_by_prazo(dias: int = 5) -> int:
+    """Escala para P0 concursos abertos a <= `dias` dias do prazo.
+
+    Complementa o modelo 'tudo entra P2' do scan-concursos-publicos: a
+    urgencia sobe por proximidade real do prazo, nao a entrada. Correr
+    DEPOIS de expire_overdue_concursos (a ordem importa: expirar primeiro,
+    escalar depois, senao escala-se concursos ja vencidos).
+
+    Devolve o numero de linhas escaladas.
+    """
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE briefing_items
+               SET urgencia = 'P0'
+             WHERE tipo = 'concurso_novo'
+               AND status IN ('open', 'snoozed')
+               AND urgencia <> 'P0'
+               AND metadata->>'prazo_propostas' ~ '^\\d{4}-\\d{2}-\\d{2}$'
+               AND (metadata->>'prazo_propostas')::date >= CURRENT_DATE
+               AND (metadata->>'prazo_propostas')::date <= CURRENT_DATE + $1::int
+            """,
+            dias,
+        )
+        return int(result.split()[-1])
 
 
 async def mark_done(item_id: str) -> bool:

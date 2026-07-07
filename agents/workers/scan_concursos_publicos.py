@@ -9,7 +9,8 @@ Sprint 4.3:
     dedupe por Referencia, mark-expired, listas de activos, email rico via
     Carlos com scorecard supressivo).
   * Acrescenta emissao de cards em briefing_items via services.briefing_emit:
-      - 1 card por concurso novo (P0/P1/P2 consoante prazo).
+      - 1 card por concurso novo (entra sempre P2; escalacao diaria a P0
+        pelo briefing-inbox quando faltam <=5 dias de prazo).
       - 1 card-resumo por execucao quando ha novos.
 
 Fontes V1.2 (active):
@@ -813,14 +814,22 @@ def _empresa_canonica(empresa_slug: str) -> str:
 
 
 def _urgencia_pelo_prazo(prazo: date | None) -> str:
-    """P0 se prazo < 7 dias, P1 se < 21, senao P2."""
-    if prazo is None:
-        return "P2"
-    delta = (prazo - date.today()).days
-    if delta < 7:
-        return "P0"
-    if delta < 21:
-        return "P1"
+    """Urgencia a entrada e sempre P2.
+
+    Modelo novo (07-2026): os concursos entram todos como P2 e a escalacao
+    para P0 e feita diariamente pelo briefing-inbox via
+    briefing_db.escalate_concursos_by_prazo(dias=5), quando faltam <=5 dias
+    para o prazo de propostas e o concurso continua aberto. Concursos com
+    prazo vencido sao auto-expirados por expire_overdue_concursos.
+
+    Racional: o dataset dados.gov entrega concursos frequentemente ja perto
+    do prazo; o modelo antigo (P0 se <7d, P1 se <21d a entrada) enchia o
+    separador URGENTE e tirava-lhe significado. Fontes sem prazo (AcinGov,
+    Vortal, DRE) continuam P2 e nunca escalam automaticamente.
+
+    O parametro `prazo` mantem-se pela assinatura dos callers; a escalacao
+    usa metadata['prazo_propostas'] persistido no card.
+    """
     return "P2"
 
 
@@ -888,7 +897,8 @@ async def _emitir_resumo_scan(
     detalhe = (
         f"Previnsa: {len(novos_prev)} novos concursos para triagem. "
         f"JMSoares: {len(novos_jms)} novos concursos para triagem. "
-        "Cards individuais P0/P1/P2 emitidos consoante prazo de propostas."
+        "Cards individuais emitidos como P2; escalacao diaria a P0 quando "
+        "faltam <=5 dias de prazo."
     )
 
     # Empresa do card-resumo: usa a que tem mais novos; em empate, OMNAI.
