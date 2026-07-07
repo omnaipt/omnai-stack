@@ -11,18 +11,26 @@ Features adoptadas do briefing_carlos legado:
      P/tratar, Manual, Rasc.).
   4. Faturas arquivadas hoje agrupadas por empresa (tabela detalhada).
   5. Faturas pendentes extraccao manual (lista + razao + link Gmail).
-  6. Rascunhos com preview (200 chars) + checkbox "Marcado respondido"
+  6. Rascunhos com preview (200 chars) + checkbox \"Marcado respondido\"
      que aciona /actions/draft-done.
 
 Bug fixes:
   A. Reload constante: usa regenerate_dynamic_section que preserva tudo
-     acima do ultimo child_database (linked DB "Tarefas Hoje" no topo)
+     acima do ultimo child_database (linked DB \"Tarefas Hoje\" no topo)
      em vez de replace_page_content total.
   B. Items resolvidos voltam a aparecer: stale-check ao iniciar -- para
      cada card de email com status=open, verifica via Gmail labels se o
      email ja saiu da INBOX. Se sim, marca done (motivo=archived_externally).
   C. Sincronizacao Notion->DB: to_dos checked com marker briefing-key
      fazem mark_done_by_chave (mantido).
+
+Briefing accionavel (07-2026):
+  D. Auto-expiracao de concursos vencidos + escalacao a P0 quando faltam
+     <=5 dias de prazo (briefing_db.expire_overdue_concursos /
+     escalate_concursos_by_prazo), a correr ANTES do list_open.
+  E. Activity Log com corpo: top 10 itens P0/P1 (empresa, prazo, accao
+     proposta) + resumo executivo, em vez de pagina vazia. Titulo ganha
+     contagens P0/P1, auto-expirados e escalados.
 
 Restricoes preservadas:
   * filtro responsabilidade David (briefing_db ja faz isto upstream)
@@ -67,6 +75,9 @@ MAIL_TOKEN_PREFIX = f"{ACTIONS_BASE_URL.rstrip('/')}/mail/"
 # Limite de cards a verificar via Gmail no stale-check (Bug B/C)
 STALE_CHECK_LIMIT = int(os.getenv("BRIEFING_STALE_CHECK_LIMIT", "50"))
 STALE_CHECK_HOURS = int(os.getenv("BRIEFING_STALE_CHECK_HOURS", "48"))
+
+# Escalacao de concursos: P0 quando faltam <= N dias de prazo
+CONCURSO_ESCALATE_DIAS = int(os.getenv("BRIEFING_CONCURSO_ESCALATE_DIAS", "5"))
 
 URGENCIA_MAP = {
     "P0": ("🔴", "URGENTE"),
@@ -755,6 +766,75 @@ def _split_carryover(items: list[dict]) -> tuple[list[dict], list[dict]]:
 
 
 # ----------------------------------------------------------------------
+# Briefing accionavel (07-2026): helpers do Activity Log
+# ----------------------------------------------------------------------
+
+def _extract_prazo(item: dict) -> date | None:
+    """Extrai o prazo (date) do metadata do item, se existir.
+
+    Reconhece a chave 'prazo_propostas' (formato ISO, usada pelos cards
+    de concursos) com fallback para 'prazo'. Valores nao-ISO (ex.:
+    'sem prazo') devolvem None. metadata pode chegar como str (asyncpg
+    devolve jsonb como texto sem codec registado).
+    """
+    meta = item.get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            import json as _json
+            meta = _json.loads(meta)
+        except Exception:
+            return None
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get("prazo_propostas") or meta.get("prazo") or ""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw[:10]).date()
+    except Exception:
+        return None
+
+
+def _acao_proposta(item: dict) -> str:
+    """Accao proposta curta para a pagina do Activity Log."""
+    tipo = item.get("tipo", "")
+    prazo = _extract_prazo(item)
+    if tipo == "concurso_novo":
+        return f"Decidir ir/nao-ir ate {prazo.isoformat() if prazo else 's/ prazo'}"
+    if tipo == "email_actionable":
+        return "Responder (draft pronto no Gmail)"
+    if tipo == "email_fatura_pendente":
+        return "Extrair fatura manualmente"
+    return "Rever e resolver"
+
+
+def _build_activity_log_children(items: list[dict], resumo: str) -> list[dict]:
+    """Corpo da entrada do Activity Log: top 10 itens P0/P1 que exigem
+    decisao (ordenados por urgencia e prazo) + resumo executivo.
+    """
+    decisao = sorted(
+        [i for i in items if i.get("urgencia") in ("P0", "P1")],
+        key=lambda i: (i.get("urgencia", "P2"), _extract_prazo(i) or date.max),
+    )[:10]
+
+    children: list[dict] = [heading(2, "Itens que exigem decisao")]
+    if decisao:
+        for i in decisao:
+            prazo = _extract_prazo(i)
+            children.append(bullet(
+                f"[{i.get('urgencia', 'P?')}] {(i.get('titulo') or '')[:120]} · "
+                f"{i.get('empresa') or '-'} · "
+                f"prazo {prazo.isoformat() if prazo else '-'} · "
+                f"{_acao_proposta(i)}",
+                link=i.get("link_origem"),
+            ))
+    else:
+        children.append(paragraph("Sem itens P0/P1 abertos."))
+    children.append(paragraph(resumo))
+    return children
+
+
+# ----------------------------------------------------------------------
 # Bug fix A: regenerate_dynamic_section
 # ----------------------------------------------------------------------
 
@@ -819,6 +899,29 @@ async def run() -> dict:
             sincronizados = await _sync_notion_to_db(nc)
     except Exception as exc:
         log.warning("notion sync FAIL", err=str(exc))
+
+    # Step 1b: lifecycle de concursos ANTES de ler os items abertos.
+    # Ordem importa: expirar primeiro (mata vencidos), escalar depois
+    # (sobe a P0 os que estao a <=N dias). Em try/except individual --
+    # o briefing nao pode morrer por causa disto.
+    expirados = 0
+    escalados = 0
+    try:
+        expirados = await briefing_db.expire_overdue_concursos()
+    except Exception as exc:
+        log.warning("expire_overdue_concursos FAIL", err=str(exc))
+    try:
+        escalados = await briefing_db.escalate_concursos_by_prazo(
+            dias=CONCURSO_ESCALATE_DIAS
+        )
+    except Exception as exc:
+        log.warning("escalate_concursos_by_prazo FAIL", err=str(exc))
+    if expirados or escalados:
+        log.info(
+            "concursos.lifecycle",
+            expirados=expirados, escalados=escalados,
+            dias=CONCURSO_ESCALATE_DIAS,
+        )
 
     # Step 2: ler items abertos
     items = await briefing_db.list_open(limit=200)
@@ -968,9 +1071,15 @@ async def run() -> dict:
         f" · {archived_externally} arquivado(s) externamente"
         if archived_externally else ""
     )
+    extra_concursos = ""
+    if expirados or escalados:
+        extra_concursos = (
+            f" · {expirados} concurso(s) auto-expirado(s)"
+            f" · {escalados} escalado(s) a P0"
+        )
     blocks.append(_paragraph(
         f"Sincronização Notion→DB: {sincronizados} item(s) marcado(s) como resolvido"
-        f"{extra_archive}."
+        f"{extra_archive}{extra_concursos}."
     ))
     blocks.append(_paragraph(DYNAMIC_END_MARKER))
 
@@ -982,18 +1091,24 @@ async def run() -> dict:
         log.error("regen FAIL", err=str(exc))
         raise
 
-    # Step 9: log no Activity Log
+    # Step 9: log no Activity Log (titulo com contagens + corpo accionavel)
+    # TODO(delta vs ontem): persistir a contagem de abertos em Redis
+    # (services/state.py, padrao set_email_stats; chave sugerida
+    # omnai:briefing:last_open_count) e mostrar "(+N vs ontem)" no titulo.
     try:
         await notion_ext.create_database_row(
             data_source_id=ACTIVITY_LOG_DB,
             title=(
                 f"Briefing inbox {hoje_iso} | {sum(stats.values())} abertos | "
-                f"{len(resolvidos)} resolvidos | sync={sincronizados} | "
-                f"stale={archived_externally}"
+                f"P0:{stats.get('P0', 0)} P1:{stats.get('P1', 0)} | "
+                f"{len(resolvidos)} resolvidos 24h | "
+                f"{expirados} auto-expirados | {escalados} escalados P0 | "
+                f"sync={sincronizados} | stale={archived_externally}"
             ),
+            children=_build_activity_log_children(items, resumo),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("activity_log FAIL", err=str(exc))
 
     out = {
         "status": "ok",
@@ -1005,6 +1120,8 @@ async def run() -> dict:
         "items_resolvidos_24h": len(resolvidos),
         "sincronizados_notion_db": sincronizados,
         "archived_externally": archived_externally,
+        "concursos_auto_expirados": expirados,
+        "concursos_escalados_p0": escalados,
         "prioridades_count": len(prioridades),
         "drafts_pending": len(drafts_raw),
         "invoices_today": len(invoices),
