@@ -60,11 +60,16 @@ ARCHIVE_DIR = Path(os.getenv("BACKUP_LOCAL_DIR", "/var/lib/omnai/archive"))
 RETENTION_DAYS = int(os.getenv("CLEANUP_BRIEFING_DAYS", "90"))
 
 
-async def _run_cmd(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
+async def _run_cmd(
+    cmd: list[str],
+    timeout: int = 600,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, **env} if env else None,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -75,16 +80,22 @@ async def _run_cmd(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
 
 
 async def _dump_briefing_items_table(target: Path) -> tuple[bool, str]:
-    """pg_dump --table=briefing_items | gzip > target."""
+    """pg_dump --table=briefing_items | gzip > target.
+
+    PGPASSWORD passa via env= (nao interpolada na string shell: evita
+    quebra com quotes na password e fuga em logs/ps).
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "/bin/sh", "-c",
-        f"PGPASSWORD='{POSTGRES_PASSWORD}' pg_dump "
+        f"pg_dump "
         f"-h {POSTGRES_HOST} -p {POSTGRES_PORT} -U {POSTGRES_USER} "
         f"--no-owner --no-acl --table=briefing_items --data-only "
         f"-d {POSTGRES_DB} | gzip -9 > '{target}'",
     ]
-    rc, out, err = await _run_cmd(cmd, timeout=600)
+    rc, out, err = await _run_cmd(
+        cmd, timeout=600, env={"PGPASSWORD": POSTGRES_PASSWORD}
+    )
     if rc != 0:
         return False, f"pg_dump rc={rc} err={err[:500]}"
     if not target.exists() or target.stat().st_size < 100:
