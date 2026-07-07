@@ -65,9 +65,9 @@ async def _run_cmd(
 async def _dump_briefing_items_table(target: Path) -> tuple[bool, str]:
     """pg_dump --table=briefing_items | gzip > target.
 
-    A password segue por PGPASSWORD no ambiente do subprocess (env=), nunca
-    interpolada na string do shell: evita quebra com quotes/metacaracteres
-    na password e fuga da mesma em logs ou na lista de processos.
+    PGPASSWORD e passada via env= do subprocess, NAO interpolada na string
+    shell: evita quebrar com quotes/caracteres especiais na password e
+    evita fuga da password em logs ou na lista de processos.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
