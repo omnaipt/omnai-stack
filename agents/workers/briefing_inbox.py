@@ -21,6 +21,15 @@ Mudanca chave Sprint 7.6:
   fallback para replace_page_content (comportamento Sprint 7) e adiciona os
   markers no fim para proximas execucoes funcionarem em modo incremental.
 
+Mudanca 2026-07-07 (briefing accionavel):
+- run() chama briefing_db.expire_overdue_concursos() e
+  briefing_db.escalate_concursos_by_prazo(dias=5) ANTES de list_open.
+  Ordem importa: expirar primeiro, escalar depois.
+- A entrada do Activity Log deixa de ser so titulo: passa a ter children
+  com os top 10 itens P0/P1 e accao proposta, e o titulo ganha contagem de
+  auto-expirados/escalados e delta de abertos vs execucao anterior
+  (Redis: omnai:briefing:last_open_count, padrao services.state).
+
 Setup inicial: correr setup_todo_view.py UMA vez para configurar a vista
 persistente + markers. Depois o briefing_inbox encarrega-se do resto.
 """
@@ -34,7 +43,7 @@ from typing import Any
 
 import structlog
 
-from services import briefing_db, notion_ext
+from services import briefing_db, notion_ext, state
 from services.action_tokens import link_for, make_token
 from services.briefing_db import mark_done_by_chave
 from services.llm import generate
@@ -490,7 +499,7 @@ def _extract_prazo(item: dict) -> date | None:
     meta = item.get("metadata") or {}
     if not isinstance(meta, dict):
         return None
-    for key in ("prazo", "data_limite", "deadline", "data", "due"):
+    for key in ("prazo", "prazo_propostas", "data_limite", "deadline", "data", "due"):
         v = meta.get(key)
         d = _parse_iso_date(v)
         if d:
@@ -847,6 +856,51 @@ async def _resumo_executivo(items: list[dict], stats: dict[str, int]) -> str:
 
 
 # ----------------------------------------------------------------------
+# Activity Log accionavel (2026-07-07)
+# ----------------------------------------------------------------------
+
+# Chave Redis com a contagem de abertos da execucao anterior, para calcular
+# o delta 'vs ontem' no titulo do Activity Log (padrao services.state).
+BRIEFING_LAST_OPEN_COUNT_KEY = "omnai:briefing:last_open_count"
+
+
+def _acao_proposta(it: dict) -> str:
+    """Accao proposta de uma linha para um item do briefing."""
+    tipo = it.get("tipo", "")
+    prazo = _extract_prazo(it)
+    if tipo == "concurso_novo":
+        return f"Decidir ir/nao-ir ate {prazo.isoformat() if prazo else 's/ prazo'}"
+    if tipo == "email_actionable":
+        return "Responder (draft pronto no Gmail)"
+    if tipo == "email_fatura_pendente":
+        return "Extrair fatura manualmente"
+    return "Rever e resolver"
+
+
+async def _get_last_open_count() -> int | None:
+    """Contagem de abertos da execucao anterior (Redis). None se indisponivel."""
+    try:
+        c = state._c()
+        if c is None:
+            return None
+        v = await c.get(BRIEFING_LAST_OPEN_COUNT_KEY)
+        return int(v) if v is not None else None
+    except Exception as exc:
+        log.warning("get_last_open_count FAIL", err=str(exc))
+        return None
+
+
+async def _set_last_open_count(n: int) -> None:
+    try:
+        c = state._c()
+        if c is None:
+            return
+        await c.set(BRIEFING_LAST_OPEN_COUNT_KEY, str(n), ex=60 * 60 * 72)
+    except Exception as exc:
+        log.warning("set_last_open_count FAIL", err=str(exc))
+
+
+# ----------------------------------------------------------------------
 # Run principal
 # ----------------------------------------------------------------------
 
@@ -864,6 +918,19 @@ async def run() -> dict:
             tarefas_total, tarefas_por_empresa = await _count_tarefas_hoje(nc)
     except Exception as exc:
         log.warning("notion sync FAIL", err=str(exc))
+
+    # ----- Housekeeping de concursos ANTES de listar (2026-07-07) -----
+    # Ordem importa: expirar primeiro (dismiss dos vencidos), escalar depois
+    # (P0 quando faltam <=5 dias). Assim list_open/stats ja reflectem o estado.
+    expirados = 0
+    escalados = 0
+    try:
+        expirados = await briefing_db.expire_overdue_concursos()
+        escalados = await briefing_db.escalate_concursos_by_prazo(dias=5)
+        if expirados or escalados:
+            log.info("concursos housekeeping", expirados=expirados, escalados=escalados)
+    except Exception as exc:
+        log.warning("expire/escalate concursos FAIL", err=str(exc))
 
     items = await briefing_db.list_open(limit=200)
     stats = await briefing_db.stats_por_urgencia()
@@ -957,30 +1024,63 @@ async def run() -> dict:
         log.error("regenerate_dynamic_section FAIL", err=str(exc))
         raise
 
+    # ----- Activity Log accionavel: top 10 P0/P1 com accao proposta -----
+    abertos = sum(stats.values())
+    abertos_ontem = await _get_last_open_count()
+    delta_str = (
+        f" ({abertos - abertos_ontem:+d} vs ontem)"
+        if abertos_ontem is not None
+        else ""
+    )
+
+    decisao = sorted(
+        [i for i in items if i.get("urgencia") in ("P0", "P1")],
+        key=lambda i: (i.get("urgencia") or "P2", _extract_prazo(i) or date.max),
+    )[:10]
+
+    children: list[dict] = [heading(2, "Itens que exigem decisao")]
+    if decisao:
+        for i in decisao:
+            prazo = _extract_prazo(i)
+            children.append(bullet(
+                f"[{i.get('urgencia', 'P2')}] {(i.get('titulo') or '')[:120]} · "
+                f"{i.get('empresa') or '-'} · "
+                f"prazo {prazo.isoformat() if prazo else '-'} · "
+                f"{_acao_proposta(i)}",
+                link=i.get("link_origem"),
+            ))
+    else:
+        children.append(paragraph("Sem itens P0/P1 abertos."))
+    children.append(paragraph(resumo))
+
     try:
         await notion_ext.create_database_row(
             data_source_id=ACTIVITY_LOG_DB,
             title=(
-                f"Briefing inbox {hoje_iso} | "
-                f"{sum(stats.values())} abertos | "
-                f"{tarefas_total} tarefas | "
-                f"{len(resolvidos)} resolvidos | "
-                f"sync={sincronizados} | "
-                f"mode={regen_info.get('mode','?')}"
+                f"Briefing {hoje_iso} | "
+                f"{abertos} abertos{delta_str} | "
+                f"P0:{stats.get('P0', 0)} P1:{stats.get('P1', 0)} | "
+                f"{len(resolvidos)} resolvidos 24h | "
+                f"{expirados} auto-expirados | {escalados} escalados"
             ),
+            children=children,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("activity log FAIL", err=str(exc))
+
+    await _set_last_open_count(abertos)
 
     out = {
         "status": "ok",
         "data": hoje_iso,
-        "items_abertos": sum(stats.values()),
+        "items_abertos": abertos,
         "stats": stats,
         "tarefas_briefing": tarefas_total,
         "tarefas_por_empresa": tarefas_por_empresa,
         "items_resolvidos_24h": len(resolvidos),
         "sincronizados_notion_db": sincronizados,
+        "concursos_expirados": expirados,
+        "concursos_escalados": escalados,
         "regen_mode": regen_info.get("mode"),
         "regen_deleted": regen_info.get("deleted", 0),
         "regen_appended": regen_info.get("appended", 0),

@@ -1,6 +1,8 @@
 """Acesso a tabela briefing_items (Postgres).
 
 v9.2.1: nova funcao list_recently_resolved para mostrar 'Resolvido hoje'.
+2026-07-07: expire_overdue_concursos + escalate_concursos_by_prazo
+(auto-expiracao e escalacao diaria de concursos por prazo).
 """
 from __future__ import annotations
 
@@ -176,6 +178,56 @@ async def mark_dismissed(item_id: str) -> bool:
             item_id,
         )
         return result.endswith(" 1")
+
+
+async def expire_overdue_concursos() -> int:
+    """Dismiss automatico de concursos cujo prazo de propostas ja passou.
+
+    Marca como 'dismissed' (com flag auto_expired no metadata) os cards
+    'concurso_novo' ainda abertos/snoozed cujo metadata->>'prazo_propostas'
+    e uma data ISO anterior a hoje. Concursos sem prazo ("sem prazo") nao
+    sao tocados. Devolve o numero de linhas actualizadas.
+    """
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE briefing_items
+               SET status = 'dismissed', resolvido_em = NOW(),
+                   metadata = COALESCE(metadata, '{}'::jsonb) || '{"auto_expired": true}'::jsonb
+             WHERE tipo = 'concurso_novo'
+               AND status IN ('open', 'snoozed')
+               AND metadata->>'prazo_propostas' ~ '^\\d{4}-\\d{2}-\\d{2}$'
+               AND (metadata->>'prazo_propostas')::date < CURRENT_DATE
+            """
+        )
+        return int(result.split()[-1])
+
+
+async def escalate_concursos_by_prazo(dias: int = 5) -> int:
+    """Escala para P0 os concursos abertos cujo prazo esta a <= `dias` dias.
+
+    Complementa a entrada uniforme em P2 (scan_concursos_publicos): a urgencia
+    passa a reflectir proximidade real do prazo, reavaliada a cada briefing.
+    Correr SEMPRE depois de expire_overdue_concursos (expirar primeiro,
+    escalar depois). Devolve o numero de linhas actualizadas.
+    """
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE briefing_items
+               SET urgencia = 'P0'
+             WHERE tipo = 'concurso_novo'
+               AND status IN ('open', 'snoozed')
+               AND urgencia <> 'P0'
+               AND metadata->>'prazo_propostas' ~ '^\\d{4}-\\d{2}-\\d{2}$'
+               AND (metadata->>'prazo_propostas')::date >= CURRENT_DATE
+               AND (metadata->>'prazo_propostas')::date <= CURRENT_DATE + $1::int
+            """,
+            dias,
+        )
+        return int(result.split()[-1])
 
 
 async def snooze(item_id: str, days: int = 7) -> bool:

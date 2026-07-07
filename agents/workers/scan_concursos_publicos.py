@@ -9,7 +9,8 @@ Sprint 4.3:
     dedupe por Referencia, mark-expired, listas de activos, email rico via
     Carlos com scorecard supressivo).
   * Acrescenta emissao de cards em briefing_items via services.briefing_emit:
-      - 1 card por concurso novo (P0/P1/P2 consoante prazo).
+      - 1 card por concurso novo (entra P2; escalacao diaria por prazo no
+        briefing-inbox via briefing_db.escalate_concursos_by_prazo).
       - 1 card-resumo por execucao quando ha novos.
 
 Fontes V1.2 (active):
@@ -813,14 +814,17 @@ def _empresa_canonica(empresa_slug: str) -> str:
 
 
 def _urgencia_pelo_prazo(prazo: date | None) -> str:
-    """P0 se prazo < 7 dias, P1 se < 21, senao P2."""
-    if prazo is None:
-        return "P2"
-    delta = (prazo - date.today()).days
-    if delta < 7:
-        return "P0"
-    if delta < 21:
-        return "P1"
+    """Urgencia de entrada dos cards de concurso: sempre P2.
+
+    Modelo anterior (P0 se prazo <7d, P1 se <21d) enchia o separador URGENTE
+    logo a entrada, porque o dataset dados.gov entrega concursos muitas vezes
+    ja perto do prazo, e fontes sem prazo entravam P2 e nunca subiam. Agora
+    todos os concursos entram P2 e a urgencia e reavaliada diariamente pelo
+    briefing-inbox: escalacao para P0 via briefing_db.escalate_concursos_by_prazo
+    quando faltam <=5 dias, e auto-dismiss dos vencidos via
+    briefing_db.expire_overdue_concursos. O parametro `prazo` e mantido por
+    compatibilidade de assinatura com os call-sites.
+    """
     return "P2"
 
 
@@ -888,7 +892,8 @@ async def _emitir_resumo_scan(
     detalhe = (
         f"Previnsa: {len(novos_prev)} novos concursos para triagem. "
         f"JMSoares: {len(novos_jms)} novos concursos para triagem. "
-        "Cards individuais P0/P1/P2 emitidos consoante prazo de propostas."
+        "Cards individuais emitidos em P2; escalam para P0 quando o prazo "
+        "esta a 5 dias ou menos (briefing-inbox)."
     )
 
     # Empresa do card-resumo: usa a que tem mais novos; em empate, OMNAI.
