@@ -9,14 +9,14 @@ Sprint 4.3:
     dedupe por Referencia, mark-expired, listas de activos, email rico via
     Carlos com scorecard supressivo).
   * Acrescenta emissao de cards em briefing_items via services.briefing_emit:
-      - 1 card por concurso novo (entra P2; escalacao diaria por prazo no
-        briefing-inbox via briefing_db.escalate_concursos_by_prazo).
+      - 1 card por concurso novo (entra sempre P2; a escalacao para P0 por
+        prazo e feita diariamente pelo briefing_inbox via briefing_db).
       - 1 card-resumo por execucao quando ha novos.
 
 Fontes V1.2 (active):
   * dados.gov.pt - Dataset oficial IMPIC/BASE com todos os anuncios do ano
     (JSON publico, cobre simultaneamente DRE Serie II-L + BASE.gov.pt).
-    ~10k anuncios/ano. Plataforma reportada = "BASE".
+    ~10k anuncios/ano. Plataforma reportada = \"BASE\".
   * AcinGov - autarquias e entidades publicas (HTML directo).
   * Vortal via Playwright (V1.3 com bot-protection bypass best-effort).
 
@@ -814,16 +814,18 @@ def _empresa_canonica(empresa_slug: str) -> str:
 
 
 def _urgencia_pelo_prazo(prazo: date | None) -> str:
-    """Urgencia de entrada dos cards de concurso: sempre P2.
+    """Urgencia de ENTRADA de um card de concurso: sempre P2.
 
-    Modelo anterior (P0 se prazo <7d, P1 se <21d) enchia o separador URGENTE
-    logo a entrada, porque o dataset dados.gov entrega concursos muitas vezes
-    ja perto do prazo, e fontes sem prazo entravam P2 e nunca subiam. Agora
-    todos os concursos entram P2 e a urgencia e reavaliada diariamente pelo
-    briefing-inbox: escalacao para P0 via briefing_db.escalate_concursos_by_prazo
-    quando faltam <=5 dias, e auto-dismiss dos vencidos via
-    briefing_db.expire_overdue_concursos. O parametro `prazo` e mantido por
-    compatibilidade de assinatura com os call-sites.
+    Modelo de escalacao por prazo (substitui o antigo P0/P1/P2 a entrada):
+    todos os concursos entram em P2 e o briefing_inbox escala diariamente
+    para P0, via briefing_db.escalate_concursos_by_prazo, os que continuam
+    abertos com prazo a <= 5 dias. Concursos com prazo passado sao
+    auto-dispensados por briefing_db.expire_overdue_concursos.
+
+    Razao: o dataset dados.gov entrega concursos frequentemente ja perto do
+    prazo, o que fazia quase tudo entrar P0 e esvaziava o significado do
+    separador URGENTE. Fontes sem prazo (AcinGov, Vortal, DRE) ficam em P2
+    ate haver prazo no metadata.
     """
     return "P2"
 
@@ -892,8 +894,8 @@ async def _emitir_resumo_scan(
     detalhe = (
         f"Previnsa: {len(novos_prev)} novos concursos para triagem. "
         f"JMSoares: {len(novos_jms)} novos concursos para triagem. "
-        "Cards individuais emitidos em P2; escalam para P0 quando o prazo "
-        "esta a 5 dias ou menos (briefing-inbox)."
+        "Cards individuais emitidos em P2; escalacao diaria para P0 por prazo "
+        "feita pelo briefing_inbox."
     )
 
     # Empresa do card-resumo: usa a que tem mais novos; em empate, OMNAI.
