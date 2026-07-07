@@ -32,11 +32,26 @@ log = structlog.get_logger()
 
 WORKER_NAME = "cleanup-briefing-items"
 
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "omnai_postgres")
-POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
-POSTGRES_USER = os.getenv("POSTGRES_USER", "omnai")
-POSTGRES_DB = os.getenv("POSTGRES_DB", "omnai")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
+def _parse_database_url():
+    import urllib.parse
+    url = os.getenv("DATABASE_URL", "")
+    if url:
+        u = urllib.parse.urlparse(url)
+        return {
+            "host": u.hostname or "postgres",
+            "port": str(u.port or 5432),
+            "user": u.username or "omnai",
+            "password": urllib.parse.unquote(u.password or ""),
+            "db": (u.path or "/omnai").lstrip("/"),
+        }
+    return {"host":"postgres","port":"5432","user":"omnai","password":"","db":"omnai"}
+
+_pg = _parse_database_url()
+POSTGRES_HOST = _pg["host"]
+POSTGRES_PORT = _pg["port"]
+POSTGRES_USER = _pg["user"]
+POSTGRES_DB = _pg["db"]
+POSTGRES_PASSWORD = _pg["password"]
 POSTGRES_DSN = os.getenv("POSTGRES_DSN") or os.getenv("DATABASE_URL", "")
 
 R2_BUCKET = os.getenv("R2_BUCKET", "omnai-postgres-backups")

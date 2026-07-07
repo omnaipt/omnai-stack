@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#5d8d8b" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1a1a1a" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="OMNAI">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
+<title>OMNAI</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+:root{
+  --bg:#fafaf9; --surface:#fff; --text:#0e1414; --muted:#5d6362; --hint:#9aa0a0;
+  --border:rgba(0,0,0,0.08); --border-strong:rgba(0,0,0,0.16);
+  --p0-fill:#fdecec; --p0-text:#7a1d1d; --p0-bar:#d94040;
+  --p1-fill:#fbeed7; --p1-text:#5e3805; --p1-bar:#b97515;
+  --p2-fill:#e8f2dc; --p2-text:#264f0a; --p2-bar:#5d9420;
+  --p3-fill:#eeeded; --p3-text:#444; --p3-bar:#9aa0a0;
+  --info-fill:#e1f0ff; --info-text:#0c447c; --info-bar:#185fa5;
+  --accent:#5d8d8b;
+  --shadow:0 1px 2px rgba(0,0,0,0.04);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0e1414; --surface:#161c1c; --text:#f3f4f4; --muted:#9aa0a0; --hint:#6a7070;
+    --border:rgba(255,255,255,0.08); --border-strong:rgba(255,255,255,0.16);
+    --p0-fill:#3a1414; --p0-text:#fab7b7; --p0-bar:#d94040;
+    --p1-fill:#3b2a0a; --p1-text:#f5cf85; --p1-bar:#b97515;
+    --p2-fill:#1f3010; --p2-text:#c0e08a; --p2-bar:#5d9420;
+    --p3-fill:#1f2424; --p3-text:#aaa; --p3-bar:#9aa0a0;
+    --info-fill:#0c2a4a; --info-text:#a8d4ff; --info-bar:#5fa3f3;
+    --accent:#7fb3b1;
+    --shadow:0 1px 2px rgba(0,0,0,0.4);
+  }
+}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,system-ui,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased;font-size:15px;line-height:1.5}
+body{padding:max(env(safe-area-inset-top,12px),12px) max(env(safe-area-inset-right,12px),12px) max(env(safe-area-inset-bottom,80px),80px) max(env(safe-area-inset-left,12px),12px)}
+.app{max-width:820px;margin:0 auto}
+header{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px;border-bottom:0.5px solid var(--border);margin-bottom:14px;gap:10px}
+.brand{display:flex;align-items:center;gap:9px}
+.brand img{width:30px;height:30px;border-radius:6px}
+.brand-title{font-size:16px;font-weight:600;letter-spacing:-0.01em}
+.brand-sub{font-size:11.5px;color:var(--muted)}
+
+nav.tabs{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:0.5px solid var(--border);display:flex;justify-content:space-around;padding:8px max(env(safe-area-inset-left,8px),8px) max(env(safe-area-inset-bottom,8px),8px);z-index:50;box-shadow:0 -2px 8px rgba(0,0,0,0.04)}
+nav.tabs button{background:transparent;border:0;padding:6px 8px;font-size:11px;color:var(--muted);cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;font-family:inherit;border-radius:6px;min-width:54px}
+nav.tabs button svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+nav.tabs button.active{color:var(--accent)}
+nav.tabs button.active .badge{background:var(--accent);color:white}
+.badge{display:inline-flex;align-items:center;justify-content:center;background:var(--border);color:var(--text);min-width:18px;height:16px;border-radius:99px;font-size:10px;font-weight:600;padding:0 5px;position:absolute;top:-2px;right:0}
+nav.tabs button{position:relative}
+
+main{min-height:200px}
+.page{display:none}
+.page.active{display:block;animation:fadeIn 0.18s}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+.section-title svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+.section-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);margin:16px 0 8px;display:flex;align-items:center;gap:6px}
+.section-title .count{background:var(--border);color:var(--text);padding:1px 7px;border-radius:99px;font-size:10.5px;font-weight:500;letter-spacing:0}
+
+.cards{display:flex;flex-direction:column;gap:8px}
+.card{background:var(--surface);border:0.5px solid var(--border);border-radius:10px;padding:12px 14px;position:relative;transition:opacity 0.2s,transform 0.2s,max-height 0.25s,padding 0.2s,margin 0.2s,border 0.2s;overflow:hidden;box-shadow:var(--shadow)}
+.card.lefted::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:10px 0 0 10px}
+.card.p0::before{background:var(--p0-bar)}
+.card.p1::before{background:var(--p1-bar)}
+.card.p2::before{background:var(--p2-bar)}
+.card.p3::before{background:var(--p3-bar)}
+.card.removing{opacity:0;transform:translateX(40px)}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px;flex-wrap:wrap}
+.tags{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+.tag{font-size:10px;font-weight:600;padding:2px 7px;border-radius:6px;text-transform:uppercase;letter-spacing:0.04em}
+.tag.urg-p0{background:var(--p0-fill);color:var(--p0-text)}
+.tag.urg-p1{background:var(--p1-fill);color:var(--p1-text)}
+.tag.urg-p2{background:var(--p2-fill);color:var(--p2-text)}
+.tag.urg-p3{background:var(--p3-fill);color:var(--p3-text)}
+.tag.neutral{background:var(--p3-fill);color:var(--p3-text);text-transform:none;font-weight:500;letter-spacing:0}
+.tag.info{background:var(--info-fill);color:var(--info-text);text-transform:none;font-weight:500;letter-spacing:0}
+.age{font-size:11px;color:var(--hint)}
+.title{font-size:14.5px;font-weight:500;letter-spacing:-0.005em;margin:2px 0 1px}
+.detail{font-size:13px;color:var(--muted);margin-bottom:9px;line-height:1.45;word-wrap:break-word}
+.actions{display:flex;gap:5px;flex-wrap:wrap}
+.btn{background:transparent;border:0.5px solid var(--border-strong);padding:5px 10px;border-radius:6px;font-size:12.5px;cursor:pointer;color:var(--text);display:inline-flex;align-items:center;gap:4px;font-family:inherit;transition:background 0.1s}
+.btn:hover{background:var(--bg)}
+.btn:active{transform:scale(0.97)}
+.btn:disabled{opacity:0.5;cursor:not-allowed}
+.btn svg{width:13px;height:13px;flex-shrink:0;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.btn.primary{background:var(--accent);color:white;border-color:var(--accent)}
+.btn.primary:hover{filter:brightness(0.95)}
+.btn.resolve{color:#3b6d11}
+.btn.snooze{color:#854f0b}
+.btn.dismiss{color:#5f5e5a}
+.btn.open{color:#185fa5}
+.btn.draft{color:var(--accent)}
+@media (prefers-color-scheme: dark){
+  .btn.resolve{color:#7fbf48}
+  .btn.snooze{color:#e6a542}
+  .btn.dismiss{color:#9aa0a0}
+  .btn.open{color:#5fa3f3}
+}
+
+.empty{text-align:center;padding:44px 20px;color:var(--muted)}
+.empty svg{width:42px;height:42px;margin-bottom:10px;opacity:0.4;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.empty-title{font-size:15px;font-weight:500;margin-top:4px}
+.empty-sub{font-size:13px;margin-top:3px}
+
+input.todo-input{width:100%;padding:11px 13px;background:var(--surface);border:0.5px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;font-family:inherit;box-shadow:var(--shadow)}
+input.todo-input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(93,141,139,0.15)}
+.todo-row{display:flex;align-items:flex-start;gap:10px;padding:10px 13px;background:var(--surface);border:0.5px solid var(--border);border-radius:8px;box-shadow:var(--shadow);margin-bottom:6px}
+.todo-row .chk{margin-top:3px;cursor:pointer;width:18px;height:18px;border:1.5px solid var(--border-strong);border-radius:4px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all 0.15s}
+.todo-row .chk:hover{border-color:var(--accent)}
+.todo-row.done .chk{background:var(--accent);border-color:var(--accent)}
+.todo-row .chk svg{width:12px;height:12px;stroke:white;stroke-width:3;display:none}
+.todo-row.done .chk svg{display:block}
+.todo-body{flex:1;min-width:0}
+.todo-text{font-size:14px;word-wrap:break-word}
+.todo-row.done .todo-text{text-decoration:line-through;color:var(--hint)}
+.todo-meta{font-size:11px;color:var(--hint);margin-top:2px;display:flex;gap:8px;align-items:center}
+.del-btn{background:transparent;border:0;color:var(--hint);cursor:pointer;padding:4px;border-radius:4px;opacity:0;transition:opacity 0.15s,color 0.15s}
+.todo-row:hover .del-btn{opacity:1}
+.del-btn:hover{color:#d94040}
+.del-btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2}
+
+.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:14px}
+.metric{background:var(--surface);border:0.5px solid var(--border);border-radius:10px;padding:12px;box-shadow:var(--shadow);cursor:pointer;transition:transform 0.1s}
+.metric:hover{transform:translateY(-1px)}
+.metric .label{font-size:11.5px;color:var(--muted);margin-bottom:4px;display:flex;align-items:center;gap:5px}
+.metric .label svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:2}
+.metric .value{font-size:24px;font-weight:500;letter-spacing:-0.02em}
+.metric .sub{font-size:11px;color:var(--hint);margin-top:2px}
+
+.mailbox-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:14px}
+.mailbox-card{background:var(--surface);border:0.5px solid var(--border);border-radius:10px;padding:11px 12px;box-shadow:var(--shadow);cursor:pointer;transition:transform 0.1s,border-color 0.1s}
+.mailbox-card:hover{transform:translateY(-1px)}
+.mailbox-card.active{border-color:var(--accent);border-width:1px;padding:10.5px 11.5px}
+.mailbox-card .name{font-size:13px;font-weight:500;margin-bottom:6px;display:flex;align-items:center;gap:5px;word-wrap:break-word}
+.mailbox-card .counts{display:flex;gap:10px;font-size:11px;color:var(--muted)}
+.mailbox-card .counts strong{color:var(--text);font-weight:500}
+
+.email-card{background:var(--surface);border:0.5px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:8px;box-shadow:var(--shadow)}
+.email-card.removing{opacity:0;transform:translateX(40px);transition:opacity 0.2s,transform 0.2s}
+.email-from{font-size:12px;color:var(--muted);margin-bottom:2px;word-wrap:break-word}
+.email-subject{font-size:14.5px;font-weight:500;margin-bottom:3px;word-wrap:break-word}
+.email-snippet{font-size:13px;color:var(--muted);margin-bottom:8px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.email-draft{background:var(--info-fill);color:var(--info-text);padding:9px 11px;border-radius:6px;font-size:13px;line-height:1.5;margin:8px 0;white-space:pre-wrap;border-left:2px solid var(--info-bar);max-height:300px;overflow-y:auto}
+.draft-loading{padding:10px;color:var(--muted);font-size:13px;display:flex;align-items:center;gap:6px}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.fab{position:fixed;bottom:max(env(safe-area-inset-bottom,90px),90px);right:max(env(safe-area-inset-right,16px),16px);background:var(--accent);color:white;width:48px;height:48px;border-radius:50%;border:0;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,0.15);z-index:40;transition:transform 0.15s}
+.fab:hover{transform:scale(1.05)}
+.fab svg{width:24px;height:24px;stroke:white;fill:none;stroke-width:2.5;stroke-linecap:round;stroke-linejoin:round}
+
+.loading-page{display:flex;align-items:center;justify-content:center;padding:60px;color:var(--muted)}
+.error{background:var(--p0-fill);color:var(--p0-text);padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:12px}
+.toast{position:fixed;bottom:84px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:8px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,0.2);z-index:60;opacity:0;transition:opacity 0.2s,transform 0.2s;pointer-events:none}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast.hide{opacity:0;transform:translateX(-50%) translateY(10px)}
+
+@media (max-width:600px){
+  nav.tabs button{font-size:10px}
+  nav.tabs button svg{width:20px;height:20px}
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+<header>
+  <div class="brand">
+    <img src="/static/icon-192.png" alt="OMNAI">
+    <div>
+      <div class="brand-title" id="page-title">Home</div>
+      <div class="brand-sub" id="weekinfo">…</div>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="page" id="page-home"><div class="loading-page">A carregar…</div></div>
+  <div class="page" id="page-inbox"><div class="loading-page">A carregar…</div></div>
+  <div class="page" id="page-todos"><div class="loading-page">A carregar…</div></div>
+  <div class="page" id="page-emails"><div class="loading-page">A carregar…</div></div>
+  <div class="page" id="page-invoices"><div class="loading-page">A carregar…</div></div>
+</main>
+
+</div>
+
+<nav class="tabs">
+  <button data-tab="home" class="active" aria-label="Home">
+    <svg viewBox="0 0 24 24"><path d="M3 12l9-9 9 9"/><path d="M5 10v10a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1V10"/></svg>
+    <span>Home</span>
+  </button>
+  <button data-tab="inbox" aria-label="Inbox">
+    <svg viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+    <span>Inbox <span class="badge" id="badge-inbox" style="display:none">0</span></span>
+  </button>
+  <button data-tab="todos" aria-label="Tarefas">
+    <svg viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+    <span>Tarefas <span class="badge" id="badge-todos" style="display:none">0</span></span>
+  </button>
+  <button data-tab="emails" aria-label="Emails">
+    <svg viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22 6 12 13 2 6"/></svg>
+    <span>Emails <span class="badge" id="badge-emails" style="display:none">0</span></span>
+  </button>
+  <button data-tab="invoices" aria-label="Faturas">
+    <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/></svg>
+    <span>Faturas</span>
+  </button>
+</nav>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js" defer></script>
+</body>
+</html>

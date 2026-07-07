@@ -1,31 +1,39 @@
-"""Worker: briefing-inbox v9.4.0 (Sprint 7.6)
+"""Worker: briefing-inbox v10.0 (Sprint 10).
 
-Mantem todas as features da v9.3.0:
-- Sincronizacao Notion to-do checked -> DB (mark_done_by_chave)
-- Cards URGENTE / ESTA SEMANA / ACOMPANHAR / BAIXA agrupados por urgencia
-- Resumo Carlos no topo
-- Seccao 'Resolvido nas ultimas 24h' no fundo
-- 5 seccoes Sprint 7: Proximos 7 dias, Drafts, Resumo emails, Faturas, Resolvido
+Mudancas vs v9.2.1:
 
-Mudanca chave Sprint 7.6:
-- A pagina 🌅 Hoje passa a ter uma area STATICA (preservada entre execucoes)
-  com a vista linked database 'Tarefas Hoje (David)' interactiva, e uma area
-  DINAMICA delimitada por markers HTML que e regenerada a cada execucao.
-- A funcao replace_page_content foi substituida por regenerate_dynamic_section,
-  que apaga apenas os blocks entre <!--BRIEFING_AGENT_START--> e
-  <!--BRIEFING_AGENT_END--> e re-adiciona o conteudo dinamico no fim.
-- O callout link 'To-do (David)' do Sprint 7 e REMOVIDO; a vista linked
-  database persistente no topo da pagina substitui-o por interactividade
-  directa (David clica '+ Nova' na vista para criar tarefas).
-- Compatibilidade backwards: se os markers nao existirem na pagina, faz
-  fallback para replace_page_content (comportamento Sprint 7) e adiciona os
-  markers no fim para proximas execucoes funcionarem em modo incremental.
+Features adoptadas do briefing_carlos legado:
+  1. Prioridades do dia (LLM extrai 3-5 P0/P1 dos briefing_items abertos,
+     renderizadas como to_do com link).
+  2. Pendente dos dias anteriores (carry-over): items abertos com
+     criado_em < hoje (24h+) destacados em seccao propria.
+  3. Tabela 8 inboxes detalhada (Lidos, Faturas, Arquiv., Apagad.,
+     P/tratar, Manual, Rasc.).
+  4. Faturas arquivadas hoje agrupadas por empresa (tabela detalhada).
+  5. Faturas pendentes extraccao manual (lista + razao + link Gmail).
+  6. Rascunhos com preview (200 chars) + checkbox "Marcado respondido"
+     que aciona /actions/draft-done.
 
-Setup inicial: correr setup_todo_view.py UMA vez para configurar a vista
-persistente + markers. Depois o briefing_inbox encarrega-se do resto.
+Bug fixes:
+  A. Reload constante: usa regenerate_dynamic_section que preserva tudo
+     acima do ultimo child_database (linked DB "Tarefas Hoje" no topo)
+     em vez de replace_page_content total.
+  B. Items resolvidos voltam a aparecer: stale-check ao iniciar -- para
+     cada card de email com status=open, verifica via Gmail labels se o
+     email ja saiu da INBOX. Se sim, marca done (motivo=archived_externally).
+  C. Sincronizacao Notion->DB: to_dos checked com marker briefing-key
+     fazem mark_done_by_chave (mantido).
+
+Restricoes preservadas:
+  * filtro responsabilidade David (briefing_db ja faz isto upstream)
+  * seccao Resolvido nas ultimas 24h
+  * archive Gmail no Resolver/Dispensar (continua via /actions/done
+    que chama briefing_db.mark_done + gmail_archive)
+  * NAO chama briefing_carlos.run() (legado deprecated)
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -40,21 +48,25 @@ from services.briefing_db import mark_done_by_chave
 from services.llm import generate
 from services.notion import NotionClient
 from services.notion_ext import bullet, heading, paragraph, rt
-from services.state import get_all_email_stats, peek_drafts, peek_invoices
+from services.state import (
+    get_all_email_stats,
+    peek_drafts,
+    peek_invoices,
+    peek_manual_invoices,
+    peek_pending_emails,
+)
 
 log = structlog.get_logger()
 
 
 MORNING_BRIEFING_PAGE = "33e973b9-2387-8107-8667-eadc9128ab27"
 ACTIVITY_LOG_DB = "127f34a9-d97d-40ed-9fea-d4acb5cd2b31"
-TAREFAS_DATA_SOURCE = "119b5aae-583a-4646-b732-a0975f7cf4bd"
 ACTIONS_BASE_URL = os.getenv("ACTIONS_BASE_URL", "https://agents.omnai.pt")
+MAIL_TOKEN_PREFIX = f"{ACTIONS_BASE_URL.rstrip('/')}/mail/"
 
-# Markers HTML que delimitam a area dinamica regenerada a cada execucao.
-# Tudo o que estiver ANTES de START e' preservado (vista linked database, etc).
-MARKER_START = "<!-- BRIEFING_AGENT_START -->"
-MARKER_END = "<!-- BRIEFING_AGENT_END -->"
-
+# Limite de cards a verificar via Gmail no stale-check (Bug B/C)
+STALE_CHECK_LIMIT = int(os.getenv("BRIEFING_STALE_CHECK_LIMIT", "50"))
+STALE_CHECK_HOURS = int(os.getenv("BRIEFING_STALE_CHECK_HOURS", "48"))
 
 URGENCIA_MAP = {
     "P0": ("🔴", "URGENTE"),
@@ -71,25 +83,22 @@ EMPRESA_COLORS = {
     "Pessoal": "gray",
 }
 
-# Tipos de cards que tem prazos relevantes para a seccao "Proximos 7 dias"
-DEADLINE_TIPOS = (
-    "deadline_legal",
-    "deadline_contabilidade",
-    "concurso_novo",
-    "fecho_contabilistico",
-    "extracto_bancario",
-)
-
-# Inboxes que aparecem no resumo arquivo emails (ordem fixa)
-INBOX_ORDER = [
-    "david.sardinha@omnai.pt",
-    "hello@omnai.pt",
-    "opaidapetinga@gmail.com",
-    "sopato.cascais@gmail.com",
-    "david.sardinha@sapo.pt",
-    "davidsardinhalves@gmail.com",
-    "david.sardinha@jmsoares.pt",
+EMAIL_ACCOUNTS = [
+    {"account": "david.sardinha@previnsa.com", "label": "Previnsa (Gmail forward -> Carlos)"},
+    {"account": "david.sardinha@jmsoares.pt",  "label": "JMSoares (david@jmsoares.pt)"},
+    {"account": "david.sardinha@omnai.pt",     "label": "OMNAI David (david@omnai.pt - IMAP Hostinger)"},
+    {"account": "hello@omnai.pt",              "label": "OMNAI geral (hello@omnai.pt - IMAP Hostinger)"},
+    {"account": "david.sardinha@sapo.pt",      "label": "Pessoal Sapo (david.sardinha@sapo.pt - IMAP)"},
+    {"account": "davidsardinhalves@gmail.com", "label": "Plataformas IA (davidsardinhalves@gmail.com)"},
+    {"account": "sopato.cascais@gmail.com",    "label": "Sopato imobiliaria (sopato.cascais@gmail.com)"},
+    {"account": "opaidapetinga@gmail.com",     "label": "Carlos dispatcher (opaidapetinga@gmail.com)"},
 ]
+
+GMAIL_DOMAINS = {
+    "davidsardinhalves@gmail.com",
+    "sopato.cascais@gmail.com",
+    "opaidapetinga@gmail.com",
+}
 
 SYSTEM_CARLOS = (
     "Es o Carlos, Chief of Staff do David. Resume em UM unico paragrafo curto "
@@ -98,12 +107,97 @@ SYSTEM_CARLOS = (
     "Foca-te no que e mais critico hoje e no que pode esperar."
 )
 
+SYSTEM_PRIORIDADES = (
+    "Es o Carlos, Chief of Staff. A partir da lista de items abertos do inbox "
+    "do David, escolhe os 3 a 5 MAIS criticos para hoje. Devolves SO uma lista "
+    "JSON: [{\"id\": \"<id>\", \"texto\": \"<accao directa>\"}]. "
+    "Nao expliques. Sem markdown. Texto em portugues europeu, directo, com verbo. "
+    "Maximo 80 chars por item. Prioriza P0 e P1, com empresa entre parenteses se relevante."
+)
+
 
 CHAVE_MARKER = re.compile(r"<!--briefing-key:([0-9a-f]{64})-->")
+DYNAMIC_START_MARKER = "<!--briefing:dynamic:start-->"
+DYNAMIC_END_MARKER = "<!--briefing:dynamic:end-->"
 
 
 # ----------------------------------------------------------------------
-# Sync Notion to-do -> DB (mantido inalterado da v9.2.1)
+# Helpers de blocos Notion (locais, evitam dependencia de utils.notion_blocks)
+# ----------------------------------------------------------------------
+
+def _rt_array(text: str, link: str | None = None, **annotations: Any) -> list[dict]:
+    text_obj: dict[str, Any] = {"content": (text or "")[:2000]}
+    if link:
+        text_obj["link"] = {"url": link}
+    block: dict[str, Any] = {"type": "text", "text": text_obj}
+    if annotations:
+        block["annotations"] = annotations
+    return [block]
+
+
+def _divider() -> dict:
+    return {"object": "block", "type": "divider", "divider": {}}
+
+
+def _callout(text: str, emoji: str = "📌", color: str | None = None) -> dict:
+    body: dict[str, Any] = {
+        "icon": {"type": "emoji", "emoji": emoji},
+        "rich_text": rt(text),
+    }
+    if color:
+        body["color"] = color
+    return {"object": "block", "type": "callout", "callout": body}
+
+
+def _to_do(text: str, link: str | None = None, checked: bool = False) -> dict:
+    return {
+        "object": "block",
+        "type": "to_do",
+        "to_do": {
+            "rich_text": _rt_array(text, link=link),
+            "checked": checked,
+        },
+    }
+
+
+def _paragraph_link(text: str, url: str) -> dict:
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": _rt_array(text, link=url)},
+    }
+
+
+def _table(rows: list[list[list[dict]]], has_column_header: bool = True) -> dict:
+    if not rows:
+        return _paragraph("(tabela vazia)")
+    cols = max(len(r) for r in rows)
+    children = []
+    for row in rows:
+        cells = list(row) + [_rt_array("")] * (cols - len(row))
+        children.append({
+            "object": "block",
+            "type": "table_row",
+            "table_row": {"cells": cells},
+        })
+    return {
+        "object": "block",
+        "type": "table",
+        "table": {
+            "table_width": cols,
+            "has_column_header": has_column_header,
+            "has_row_header": False,
+            "children": children,
+        },
+    }
+
+
+def _paragraph(text: str) -> dict:
+    return paragraph(text)
+
+
+# ----------------------------------------------------------------------
+# Sync Notion -> DB (mantido da v9.2.1)
 # ----------------------------------------------------------------------
 
 async def _sync_notion_to_db(nc: NotionClient) -> int:
@@ -135,7 +229,85 @@ async def _sync_notion_to_db(nc: NotionClient) -> int:
 
 
 # ----------------------------------------------------------------------
-# Cards URGENTE / ESTA SEMANA / ACOMPANHAR (mantidos da v9.2.1)
+# Bug fix B/C: stale-check de cards de email
+# ----------------------------------------------------------------------
+
+async def _stale_check_emails(items: list[dict]) -> int:
+    """Para cards tipo email_*, verifica se email ainda esta em INBOX no Gmail.
+
+    Se nao estiver, marca briefing_item como done com motivo
+    'archived_externally'. Limite STALE_CHECK_LIMIT por run, focado nos
+    items criados nas ultimas STALE_CHECK_HOURS horas.
+
+    Retorna numero de items marcados.
+    """
+    try:
+        from services import gmail as gmail_svc
+    except Exception as exc:
+        log.warning("stale_check.gmail_import_fail", err=str(exc))
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=STALE_CHECK_HOURS)
+    marcados = 0
+    checks = 0
+
+    for it in items:
+        if checks >= STALE_CHECK_LIMIT:
+            break
+        tipo = (it.get("tipo") or "").lower()
+        if not tipo.startswith("email"):
+            continue
+
+        criado = it.get("criado_em")
+        if isinstance(criado, datetime):
+            if criado.tzinfo is None:
+                criado = criado.replace(tzinfo=timezone.utc)
+            if criado < cutoff:
+                continue
+
+        meta = it.get("metadata") or {}
+        if isinstance(meta, str):
+            try:
+                import json as _json
+                meta = _json.loads(meta)
+            except Exception:
+                meta = {}
+
+        account = meta.get("account") or meta.get("inbox") or ""
+        msg_id = meta.get("gmail_message_id") or meta.get("message_id") or ""
+        if not account or not msg_id or account not in GMAIL_DOMAINS:
+            continue
+
+        checks += 1
+        try:
+            summary = await asyncio.to_thread(gmail_svc.summarize_message, account, msg_id)
+        except Exception as exc:
+            log.warning("stale_check.summarize_fail", account=account, err=str(exc))
+            continue
+
+        if not summary:
+            continue
+        labels = summary.get("labels") or []
+        if "INBOX" in labels:
+            continue
+
+        try:
+            chave = it.get("chave")
+            if chave and await mark_done_by_chave(chave):
+                marcados += 1
+                log.info(
+                    "stale_check.archived_externally",
+                    chave=chave[:12], account=account,
+                )
+        except Exception as exc:
+            log.warning("stale_check.mark_fail", err=str(exc))
+
+    log.info("stale_check.summary", checks=checks, marcados=marcados)
+    return marcados
+
+
+# ----------------------------------------------------------------------
+# Cards (mantidos da v9.2.1)
 # ----------------------------------------------------------------------
 
 def _empresa_tag(empresa: str | None) -> str:
@@ -262,560 +434,7 @@ def _build_resolved_card(item: dict) -> dict:
 
 
 # ----------------------------------------------------------------------
-# Sprint 7.6 - Regenerador area dinamica entre markers HTML
-# ----------------------------------------------------------------------
-
-def _block_plain_text(block: dict) -> str:
-    """Extrai texto plano de um block (paragraph/heading/etc)."""
-    btype = block.get("type")
-    if not btype:
-        return ""
-    payload = block.get(btype) or {}
-    rt_arr = payload.get("rich_text") or []
-    parts = []
-    for r in rt_arr:
-        # API devolve plain_text directo
-        pt = r.get("plain_text")
-        if pt is not None:
-            parts.append(pt)
-            continue
-        txt = (r.get("text") or {}).get("content")
-        if txt:
-            parts.append(txt)
-    return "".join(parts)
-
-
-def _find_marker_indices(blocks: list[dict]) -> tuple[int | None, int | None]:
-    """Devolve (idx_start, idx_end) dos blocks que contem MARKER_START e
-    MARKER_END. Caso nao existam, devolve (None, None) ou parciais.
-    """
-    idx_start: int | None = None
-    idx_end: int | None = None
-    for i, b in enumerate(blocks):
-        text = _block_plain_text(b)
-        if idx_start is None and MARKER_START in text:
-            idx_start = i
-            continue
-        if MARKER_START in text and MARKER_END in text and idx_start is None:
-            # Caso degenerado: ambos no mesmo block. Nao suportado, ignorar.
-            continue
-        if MARKER_END in text:
-            idx_end = i
-            # Nao break: queremos o ULTIMO END caso haja duplicados (defensivo).
-    return idx_start, idx_end
-
-
-def _marker_block(content: str) -> dict:
-    """Block paragraph apenas com texto cinza contendo o marker HTML."""
-    return {
-        "object": "block",
-        "type": "paragraph",
-        "paragraph": {
-            "rich_text": [{
-                "type": "text",
-                "text": {"content": content},
-                "annotations": {"color": "gray", "italic": True},
-            }],
-        },
-    }
-
-
-async def regenerate_dynamic_section(
-    nc: NotionClient, page_id: str, new_content: list[dict]
-) -> dict[str, Any]:
-    """Regenera apenas a area dinamica entre MARKER_START e MARKER_END.
-
-    Comportamento:
-    1. Le todos os blocks da pagina via get_block_children.
-    2. Identifica indices dos markers.
-    3. Se ambos existem: apaga blocks entre eles (exclusivo nas pontas) e
-       tambem o block END (que sera re-adicionado no fim). Mantem START intacto.
-       Depois faz append em sequencia: new_content + END marker.
-       Nota: a Notion API so suporta append no FIM da lista de filhos. Para
-       que isto resulte sem reordenar a vista linked database, o END marker
-       deve ser o ULTIMO block da pagina antes da regeneracao. Como apagamos
-       END junto com o conteudo dinamico, o append no fim coloca o novo
-       conteudo + END novamente no fim, depois de START. Funciona desde que
-       nao haja blocks STATICOS apos END (que e o desenho).
-    4. Se markers nao existem: fallback compativel. Faz replace_page_content
-       de forma especial: preserva blocks ate encontrar um heading
-       'Briefing YYYY-...' (heuristica do conteudo dinamico antigo Sprint 7),
-       senao apaga tudo. Depois adiciona markers no fim.
-
-    Devolve dict com info para logging.
-    """
-    info: dict[str, Any] = {"mode": "unknown", "deleted": 0, "appended": 0}
-
-    try:
-        existing = await nc.get_block_children(page_id)
-    except Exception as exc:
-        log.error("get_block_children FAIL", err=str(exc))
-        raise
-
-    idx_start, idx_end = _find_marker_indices(existing)
-
-    if idx_start is not None and idx_end is not None and idx_end > idx_start:
-        # Modo incremental: apagar blocks entre START (exclusivo) e END (inclusivo).
-        # END e re-adicionado no fim do append.
-        info["mode"] = "incremental"
-        to_delete = existing[idx_start + 1 : idx_end + 1]
-        for b in to_delete:
-            try:
-                await nc.delete_block(b["id"])
-                info["deleted"] += 1
-            except Exception as exc:
-                log.warning("delete_block FAIL", id=b.get("id"), err=str(exc))
-
-        # Append: conteudo novo + END marker novamente
-        payload = list(new_content) + [_marker_block(MARKER_END)]
-        await nc.append_blocks(page_id, payload)
-        info["appended"] = len(payload)
-        return info
-
-    # Modo fallback: markers ausentes ou parciais. Comportamento Sprint 7
-    # (replace_page_content) com adicao dos markers no fim para proximas
-    # execucoes operarem em modo incremental.
-    info["mode"] = "fallback_replace"
-    log.warning(
-        "markers ausentes na pagina, fallback replace_page_content",
-        idx_start=idx_start,
-        idx_end=idx_end,
-    )
-
-    for b in existing:
-        try:
-            await nc.delete_block(b["id"])
-            info["deleted"] += 1
-        except Exception as exc:
-            log.warning("delete_block FAIL (fallback)", id=b.get("id"), err=str(exc))
-
-    # No fallback NAO ha vista linked database (foi apagada). Adicionamos
-    # o conteudo dinamico precedido pelos markers (com placeholder de aviso),
-    # para que o setup_todo_view.py possa ser corrido depois e injectar a
-    # vista persistente no topo SEM destruir o que esta dentro dos markers.
-    fallback_intro: list[dict] = [
-        {
-            "object": "block",
-            "type": "callout",
-            "callout": {
-                "icon": {"type": "emoji", "emoji": "⚠️"},
-                "color": "yellow_background",
-                "rich_text": rt(
-                    "Vista 'Tarefas Hoje (David)' por configurar. "
-                    "Correr setup_todo_view.py para activar interactividade."
-                ),
-            },
-        },
-        _marker_block(MARKER_START),
-    ]
-    payload = fallback_intro + list(new_content) + [_marker_block(MARKER_END)]
-    await nc.append_blocks(page_id, payload)
-    info["appended"] = len(payload)
-    return info
-
-
-# ----------------------------------------------------------------------
-# Sprint 7 - Seccao 1: To-do (David) [REMOVIDA em Sprint 7.6]
-# ----------------------------------------------------------------------
-#
-# A funcao _build_seccao_todo do Sprint 7 (callout link + counter) foi
-# removida. A vista linked database persistente acima dos markers cobre
-# esta funcionalidade de forma interactiva (David clica '+ Nova' para criar).
-# O contador de tarefas continua a ser computado e devolvido no dict de
-# output, para ser registado no Activity Log.
-
-async def _count_tarefas_hoje(nc: NotionClient) -> tuple[int, dict[str, int]]:
-    """Conta tarefas com 'Mostrar no Briefing' = true e 'Status' != Concluido,
-    agrupando por Empresa. Devolve (total, dict empresa -> n).
-
-    Tolerante a falhas: se a query falhar, devolve (0, {}).
-    """
-    try:
-        filtro = {
-            "and": [
-                {"property": "Mostrar no Briefing", "checkbox": {"equals": True}},
-                {"property": "Status", "status": {"does_not_equal": "Concluído"}},
-            ]
-        }
-        resp = await nc.query_data_source(
-            data_source_id=TAREFAS_DATA_SOURCE,
-            filter_=filtro,
-            page_size=100,
-        )
-    except Exception as exc:
-        log.warning("count_tarefas_hoje FAIL", err=str(exc))
-        return 0, {}
-
-    results = resp.get("results", []) if isinstance(resp, dict) else []
-    por_empresa: dict[str, int] = {}
-    for page in results:
-        props = page.get("properties", {}) or {}
-        empresa = "Sem empresa"
-        emp_prop = props.get("Empresa") or props.get("Cliente") or {}
-        if emp_prop.get("type") == "select" and emp_prop.get("select"):
-            empresa = emp_prop["select"].get("name") or empresa
-        elif emp_prop.get("type") == "multi_select":
-            opts = emp_prop.get("multi_select") or []
-            if opts:
-                empresa = opts[0].get("name") or empresa
-        por_empresa[empresa] = por_empresa.get(empresa, 0) + 1
-
-    return len(results), por_empresa
-
-
-# ----------------------------------------------------------------------
-# Sprint 7 - Seccao 2: Proximos 7 dias
-# ----------------------------------------------------------------------
-
-def _parse_iso_date(value: Any) -> date | None:
-    if not value:
-        return None
-    if isinstance(value, date) and not isinstance(value, datetime):
-        return value
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
-        except Exception:
-            try:
-                return date.fromisoformat(value[:10])
-            except Exception:
-                return None
-    return None
-
-
-def _extract_prazo(item: dict) -> date | None:
-    """Tenta encontrar uma data limite no metadata do item."""
-    meta = item.get("metadata") or {}
-    if not isinstance(meta, dict):
-        return None
-    for key in ("prazo", "data_limite", "deadline", "data", "due"):
-        v = meta.get(key)
-        d = _parse_iso_date(v)
-        if d:
-            return d
-    return None
-
-
-def _build_seccao_proximos_7d(items: list[dict]) -> list[dict]:
-    """Lista cronologica dos cards com prazo nos proximos 7 dias.
-
-    NAO duplica cards: faz lista vertical breve com data + titulo + empresa,
-    sem callouts de accao (o card completo ja aparece em URGENTE/SEMANA).
-    """
-    hoje = date.today()
-    limite = hoje + timedelta(days=7)
-
-    candidatos: list[tuple[date, dict]] = []
-    for it in items:
-        if it.get("tipo") not in DEADLINE_TIPOS:
-            continue
-        prazo = _extract_prazo(it)
-        if prazo is None:
-            continue
-        if prazo < hoje or prazo > limite:
-            continue
-        candidatos.append((prazo, it))
-
-    if not candidatos:
-        return []
-
-    candidatos.sort(key=lambda t: t[0])
-
-    blocks: list[dict] = [heading(2, f"⏰ Próximos 7 dias  ({len(candidatos)})")]
-    for prazo, it in candidatos:
-        delta = (prazo - hoje).days
-        if delta == 0:
-            quando = "HOJE"
-        elif delta == 1:
-            quando = "amanhã"
-        else:
-            quando = f"em {delta}d ({prazo.isoformat()})"
-
-        urg = it.get("urgencia", "P2")
-        emoji = URGENCIA_MAP.get(urg, ("⚪", ""))[0]
-        empresa = it.get("empresa") or ""
-        emp_suffix = f"  ·  {empresa}" if empresa else ""
-
-        rt_parts = [
-            {"type": "text",
-             "text": {"content": f"{quando}: "},
-             "annotations": {"bold": True, "color": "red" if delta <= 1 else "orange"}},
-            {"type": "text",
-             "text": {"content": f"{emoji} {it.get('titulo','')}"}},
-            {"type": "text",
-             "text": {"content": emp_suffix},
-             "annotations": {"color": EMPRESA_COLORS.get(empresa, "gray")}},
-        ]
-        blocks.append({
-            "object": "block",
-            "type": "bulleted_list_item",
-            "bulleted_list_item": {"rich_text": rt_parts},
-        })
-    return blocks
-
-
-# ----------------------------------------------------------------------
-# Sprint 7 - Seccao 3: Drafts pendentes
-# ----------------------------------------------------------------------
-
-def _gmail_url(account: str, message_id: str) -> str:
-    if not message_id:
-        return f"https://mail.google.com/mail/u/?authuser={account}#inbox"
-    return f"https://mail.google.com/mail/u/?authuser={account}#all/{message_id}"
-
-
-def _empresa_for_inbox(inbox: str) -> str:
-    inbox = (inbox or "").lower()
-    if "omnai" in inbox:
-        return "OMNAI"
-    if "petinga" in inbox or "previnsa" in inbox:
-        return "Previnsa"
-    if "jmsoares" in inbox:
-        return "JMSoares"
-    if "sopato" in inbox:
-        return "Sopato"
-    return "Pessoal"
-
-
-def _build_draft_card(d: dict) -> dict:
-    subject = (d.get("subject") or "(sem assunto)")[:200]
-    from_addr = (d.get("from_addr") or d.get("from") or "?")[:120]
-    account = d.get("account") or d.get("inbox") or ""
-    empresa = _empresa_for_inbox(account)
-    preview = (d.get("preview") or d.get("draft_text") or d.get("full_text") or "")[:240]
-    if len(preview) >= 240:
-        preview = preview.rstrip() + "…"
-    draft_url = d.get("url") or _gmail_url(account, d.get("gmail_message_id", ""))
-    draft_id = d.get("draft_id") or ""
-
-    try:
-        token = make_token(draft_id, "draft-done")
-        link_done = (
-            f"{ACTIONS_BASE_URL.rstrip('/')}/actions/draft-done"
-            f"?id={draft_id}&t={token}"
-        )
-    except Exception:
-        link_done = ""
-
-    title_parts = [
-        {"type": "text",
-         "text": {"content": f"Resposta para {from_addr}"},
-         "annotations": {"bold": True}},
-        {"type": "text",
-         "text": {"content": f"  ·  {empresa}"},
-         "annotations": {"color": EMPRESA_COLORS.get(empresa, "default")}},
-        {"type": "text",
-         "text": {"content": f"\n{subject}"},
-         "annotations": {"italic": True, "color": "gray"}},
-    ]
-
-    actions_rt: list[dict] = [
-        {"type": "text",
-         "text": {"content": "📧 Abrir email", "link": {"url": _gmail_url(account, d.get('gmail_message_id', ''))}},
-         "annotations": {"color": "blue"}},
-        {"type": "text", "text": {"content": "    "}},
-        {"type": "text",
-         "text": {"content": "✏️ Editar draft", "link": {"url": draft_url}},
-         "annotations": {"color": "purple"}},
-    ]
-    if link_done:
-        actions_rt.extend([
-            {"type": "text", "text": {"content": "    "}},
-            {"type": "text",
-             "text": {"content": "✓ Marcado respondido", "link": {"url": link_done}},
-             "annotations": {"color": "green"}},
-        ])
-
-    children = [
-        {"object": "block", "type": "paragraph",
-         "paragraph": {"rich_text": [{"type": "text",
-                                      "text": {"content": preview},
-                                      "annotations": {"color": "gray"}}]}},
-        {"object": "block", "type": "paragraph",
-         "paragraph": {"rich_text": actions_rt}},
-    ]
-
-    return {
-        "object": "block",
-        "type": "callout",
-        "callout": {
-            "icon": {"type": "emoji", "emoji": "✉️"},
-            "color": "purple_background",
-            "rich_text": title_parts,
-            "children": children,
-        },
-    }
-
-
-async def _build_seccao_drafts() -> list[dict]:
-    try:
-        drafts = await peek_drafts()
-    except Exception as exc:
-        log.warning("peek_drafts FAIL", err=str(exc))
-        return []
-
-    drafts = (drafts or [])[:20]
-    if not drafts:
-        return []
-
-    blocks: list[dict] = [heading(2, f"✉️ Drafts pendentes  ({len(drafts)})")]
-    for d in drafts:
-        blocks.append(_build_draft_card(d))
-    return blocks
-
-
-# ----------------------------------------------------------------------
-# Sprint 7 - Seccao 4: Resumo arquivo emails 24h
-# ----------------------------------------------------------------------
-
-def _stat_int(stats: dict[str, str], *keys: str) -> int:
-    for k in keys:
-        v = stats.get(k)
-        if v is None:
-            continue
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            continue
-    return 0
-
-
-async def _build_seccao_resumo_emails() -> list[dict]:
-    try:
-        all_stats = await get_all_email_stats()
-    except Exception as exc:
-        log.warning("get_all_email_stats FAIL", err=str(exc))
-        return []
-
-    if not all_stats:
-        return []
-
-    blocks: list[dict] = [heading(2, "📊 Resumo arquivo emails 24h")]
-
-    header_cells = ["Inbox", "Lidos", "Classif.", "Drafts", "Faturas", "Arquivados"]
-    rows: list[list[str]] = [header_cells]
-
-    todas_inboxes = list(INBOX_ORDER)
-    for k in all_stats.keys():
-        if k not in todas_inboxes:
-            todas_inboxes.append(k)
-
-    total_lidos = total_class = total_drafts = total_inv = total_arch = 0
-    for inbox in todas_inboxes:
-        s = all_stats.get(inbox)
-        if not s:
-            continue
-        lidos = _stat_int(s, "read")
-        kept = _stat_int(s, "kept")
-        classif = max(0, lidos - kept)
-        drafts_n = _stat_int(s, "pending", "drafts")
-        invoices_n = _stat_int(s, "invoices")
-        arquivados = _stat_int(s, "archived")
-        total_lidos += lidos
-        total_class += classif
-        total_drafts += drafts_n
-        total_inv += invoices_n
-        total_arch += arquivados
-        short = inbox.split("@")[0] if "@" in inbox else inbox
-        rows.append([short, str(lidos), str(classif), str(drafts_n), str(invoices_n), str(arquivados)])
-
-    if len(rows) == 1:
-        blocks.append(paragraph("Sem stats de email nas ultimas 24h."))
-        return blocks
-
-    rows.append(["TOTAL", str(total_lidos), str(total_class), str(total_drafts),
-                 str(total_inv), str(total_arch)])
-
-    table_rows: list[dict] = []
-    for i, r in enumerate(rows):
-        cells = []
-        for j, val in enumerate(r):
-            ann: dict[str, Any] = {}
-            if i == 0 or i == len(rows) - 1:
-                ann["bold"] = True
-            cells.append([{"type": "text", "text": {"content": val}, "annotations": ann}])
-        table_rows.append({
-            "object": "block",
-            "type": "table_row",
-            "table_row": {"cells": cells},
-        })
-
-    blocks.append({
-        "object": "block",
-        "type": "table",
-        "table": {
-            "table_width": len(header_cells),
-            "has_column_header": True,
-            "has_row_header": False,
-            "children": table_rows,
-        },
-    })
-    return blocks
-
-
-# ----------------------------------------------------------------------
-# Sprint 7 - Seccao 5: Faturas arquivadas 24h
-# ----------------------------------------------------------------------
-
-def _fatura_line(entry: dict) -> dict:
-    filename = entry.get("filename") or entry.get("path") or entry.get("subject") or "(sem nome)"
-    if isinstance(filename, str) and "/" in filename:
-        filename = filename.rsplit("/", 1)[-1]
-    empresa = entry.get("company") or entry.get("empresa") or ""
-    total = entry.get("total")
-    total_s = ""
-    if total is not None:
-        try:
-            total_s = f"{float(total):.2f} €"
-        except (TypeError, ValueError):
-            total_s = str(total)
-
-    rt_parts = [
-        {"type": "text", "text": {"content": str(filename)[:160]}},
-    ]
-    if empresa:
-        rt_parts.append({
-            "type": "text",
-            "text": {"content": f"  ·  {empresa}"},
-            "annotations": {"color": EMPRESA_COLORS.get(empresa, "gray")},
-        })
-    if total_s:
-        rt_parts.append({
-            "type": "text",
-            "text": {"content": f"  ·  {total_s}"},
-            "annotations": {"bold": True, "color": "green"},
-        })
-
-    return {
-        "object": "block",
-        "type": "bulleted_list_item",
-        "bulleted_list_item": {"rich_text": rt_parts},
-    }
-
-
-async def _build_seccao_faturas() -> list[dict]:
-    try:
-        faturas = await peek_invoices()
-    except Exception as exc:
-        log.warning("peek_invoices FAIL", err=str(exc))
-        return []
-
-    faturas = (faturas or [])[:10]
-    if not faturas:
-        return []
-
-    blocks: list[dict] = [heading(2, f"📄 Faturas arquivadas 24h  ({len(faturas)})")]
-    for entry in faturas:
-        if not isinstance(entry, dict):
-            continue
-        blocks.append(_fatura_line(entry))
-    return blocks
-
-
-# ----------------------------------------------------------------------
-# Resumo Carlos (mantido inalterado)
+# Resumo executivo + Prioridades do dia
 # ----------------------------------------------------------------------
 
 async def _resumo_executivo(items: list[dict], stats: dict[str, int]) -> str:
@@ -846,6 +465,345 @@ async def _resumo_executivo(items: list[dict], stats: dict[str, int]) -> str:
         return f"Inbox tem {sum(stats.values())} item(s) abertos. Tratar P0 primeiro."
 
 
+async def _prioridades_do_dia(items: list[dict]) -> list[dict]:
+    """LLM extrai 3-5 items mais criticos. Devolve [{id, texto, link_origem}]."""
+    if not items:
+        return []
+
+    candidatos = [i for i in items if i.get("urgencia") in ("P0", "P1")]
+    if len(candidatos) < 3:
+        candidatos = candidatos + [i for i in items if i.get("urgencia") == "P2"]
+    candidatos = candidatos[:15]
+
+    if not candidatos:
+        return []
+
+    sample_lines = []
+    for i in candidatos:
+        sample_lines.append(
+            f"- id={i['id']} | {i.get('urgencia','P2')} | "
+            f"{(i.get('titulo') or '')[:120]} | {i.get('empresa') or '-'}"
+        )
+
+    prompt = (
+        f"Items abertos no inbox executivo, {date.today().isoformat()}:\n\n"
+        + "\n".join(sample_lines)
+        + "\n\nDevolve JSON com 3 a 5 prioridades, formato: "
+        '[{"id": "<id>", "texto": "<accao curta com verbo>"}]'
+    )
+
+    try:
+        raw = await generate(system=SYSTEM_PRIORIDADES, prompt=prompt, max_tokens=600)
+    except Exception as exc:
+        log.warning("prioridades.llm_fail", err=str(exc))
+        return _prioridades_fallback(candidatos)
+
+    import json as _json
+    raw = (raw or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+    try:
+        parsed = _json.loads(raw)
+    except Exception:
+        log.warning("prioridades.parse_fail", raw_head=raw[:120])
+        return _prioridades_fallback(candidatos)
+
+    if not isinstance(parsed, list):
+        return _prioridades_fallback(candidatos)
+
+    by_id = {str(i["id"]): i for i in candidatos}
+    out: list[dict] = []
+    for entry in parsed[:5]:
+        if not isinstance(entry, dict):
+            continue
+        eid = str(entry.get("id") or "")
+        texto = (entry.get("texto") or "").strip()
+        if not eid or not texto:
+            continue
+        item = by_id.get(eid)
+        if not item:
+            continue
+        out.append({
+            "id": eid,
+            "texto": texto[:200],
+            "link_origem": item.get("link_origem"),
+            "chave": item.get("chave"),
+        })
+    if not out:
+        return _prioridades_fallback(candidatos)
+    return out
+
+
+def _prioridades_fallback(items: list[dict]) -> list[dict]:
+    """Fallback determinista: top P0/P1 por ordem original, max 5."""
+    out: list[dict] = []
+    for i in items[:5]:
+        out.append({
+            "id": str(i["id"]),
+            "texto": (i.get("titulo") or "")[:160],
+            "link_origem": i.get("link_origem"),
+            "chave": i.get("chave"),
+        })
+    return out
+
+
+# ----------------------------------------------------------------------
+# Tabela 8 inboxes
+# ----------------------------------------------------------------------
+
+def _build_email_table(email_stats: dict, drafts_by_account: dict) -> dict:
+    header = [
+        _rt_array("Conta"), _rt_array("Lidos"), _rt_array("Faturas"),
+        _rt_array("Arquiv."), _rt_array("Apagad."), _rt_array("P/tratar"),
+        _rt_array("Manual"), _rt_array("Rasc."),
+    ]
+    rows = [header]
+    for acc in EMAIL_ACCOUNTS:
+        s = email_stats.get(acc["account"], {})
+        drafts_n = drafts_by_account.get(acc["account"], 0)
+        rows.append([
+            _rt_array(acc["label"]),
+            _rt_array(str(s.get("read", "—"))),
+            _rt_array(str(s.get("invoices", "—"))),
+            _rt_array(str(s.get("archived", "—"))),
+            _rt_array(str(s.get("deleted", "—"))),
+            _rt_array(str(s.get("pending", "—"))),
+            _rt_array(str(s.get("manual_invoices", "—"))),
+            _rt_array(str(drafts_n) if drafts_n else "—"),
+        ])
+    return _table(rows, has_column_header=True)
+
+
+# ----------------------------------------------------------------------
+# Faturas arquivadas hoje (por empresa)
+# ----------------------------------------------------------------------
+
+def _build_invoices_archived_today(invoices: list[dict]) -> list[dict]:
+    blocks: list[dict] = [heading(2, f"📁 Faturas arquivadas hoje  ({len(invoices)})")]
+    if not invoices:
+        blocks.append(_callout("Sem faturas arquivadas hoje.", emoji="📂"))
+        return blocks
+
+    by_company: dict[str, list[dict]] = {}
+    total_amount: float = 0.0
+    for inv in invoices:
+        c = inv.get("company") or "Outros"
+        by_company.setdefault(c, []).append(inv)
+        try:
+            total_amount += float(inv.get("amount") or 0)
+        except Exception:
+            pass
+
+    blocks.append(_paragraph(
+        f"{len(invoices)} fatura(s) arquivada(s) hoje. "
+        f"Valor total estimado: {total_amount:.2f} EUR (aproximado)."
+    ))
+
+    for company in sorted(by_company.keys()):
+        items = by_company[company]
+        blocks.append(heading(3, f"{company} ({len(items)})"))
+        header = [
+            _rt_array("Fornecedor"), _rt_array("Data"),
+            _rt_array("Valor"), _rt_array("Trimestre"), _rt_array("Ficheiro"),
+        ]
+        rows = [header]
+        for inv in items:
+            amount = inv.get("amount")
+            cur = inv.get("currency", "EUR")
+            amt_str = f"{float(amount):.2f} {cur}" if amount else "—"
+            rows.append([
+                _rt_array(str(inv.get("supplier") or "—")),
+                _rt_array(str(inv.get("date") or "—")),
+                _rt_array(amt_str),
+                _rt_array(str(inv.get("quarter") or "—")),
+                _rt_array(str(inv.get("filename", ""))[-50:]),
+            ])
+        blocks.append(_table(rows, has_column_header=True))
+    return blocks
+
+
+# ----------------------------------------------------------------------
+# Faturas pendentes extraccao manual
+# ----------------------------------------------------------------------
+
+def _build_manual_invoices(manual: list[dict]) -> list[dict]:
+    blocks: list[dict] = [heading(2, f"🧾 Faturas pendentes extracção manual  ({len(manual)})")]
+    if not manual:
+        blocks.append(_callout("Sem faturas para extracção manual.", emoji="✅"))
+        return blocks
+    blocks.append(_paragraph(
+        f"{len(manual)} email(s) classificados como fatura mas o Carlos não conseguiu "
+        "extrair o PDF automaticamente. Abre cada um e arquiva manualmente."
+    ))
+    for m in manual[:30]:
+        subj = (m.get("subject") or "(sem assunto)")[:80]
+        frm = (m.get("from") or "")[:40]
+        inbox = m.get("inbox") or m.get("account") or ""
+        label = f"→ {subj} | {frm} | {inbox}"
+        url = m.get("url", "")
+        if url:
+            blocks.append(_paragraph_link(label, url))
+        else:
+            blocks.append(_paragraph(label))
+        if m.get("reason"):
+            blocks.append(_callout(f"Razão: {m['reason']}", emoji="⚠️"))
+    return blocks
+
+
+# ----------------------------------------------------------------------
+# Drafts com preview + checkbox draft-done
+# ----------------------------------------------------------------------
+
+def _draft_id(d: dict) -> str | None:
+    return (
+        d.get("id")
+        or d.get("draft_id")
+        or d.get("gmail_draft_id")
+        or d.get("thread_id")
+        or d.get("threadId")
+    )
+
+
+def _build_drafts_section(drafts: list[dict]) -> list[dict]:
+    blocks: list[dict] = [heading(2, f"✉️ Rascunhos de resposta ({len(drafts)})")]
+    if not drafts:
+        blocks.append(_callout("Sem rascunhos pendentes.", emoji="✉️"))
+        return blocks
+
+    for d in drafts[:25]:
+        subj = (d.get("subject") or "(sem assunto)")[:120]
+        from_addr = (d.get("from_addr") or d.get("from") or "?")[:60]
+        account = d.get("account") or "?"
+        url = d.get("url") or ""
+        label = f"→ {subj} | De: {from_addr} | Caixa: {account}"
+        if url:
+            blocks.append(_paragraph_link(label, url))
+        else:
+            blocks.append(_paragraph(label))
+
+        preview = d.get("preview") or d.get("draft_text") or d.get("body") or ""
+        if preview:
+            blocks.append(_callout(preview[:200], emoji="📝"))
+
+        # Checkbox 'Marcado respondido' -> /actions/draft-done
+        did = _draft_id(d)
+        if did:
+            try:
+                token = make_token(str(did), "draft-done")
+                draft_url = (
+                    f"{ACTIONS_BASE_URL.rstrip('/')}/actions/draft-done"
+                    f"?id={did}&t={token}"
+                )
+                blocks.append(_to_do(
+                    "Marcado respondido",
+                    link=draft_url,
+                    checked=False,
+                ))
+            except Exception as exc:
+                log.warning("draft.token_fail", id=str(did), err=str(exc))
+
+    return blocks
+
+
+# ----------------------------------------------------------------------
+# Pending emails (checkbox -> auto-archive na proxima corrida)
+# ----------------------------------------------------------------------
+
+def _build_pending_emails(pending: list[dict]) -> list[dict]:
+    if not pending:
+        return []
+    blocks: list[dict] = [
+        heading(2, f"📧 Emails pendentes de acção (marca ✅ para arquivar)  ({len(pending)})"),
+        _paragraph(
+            "Marca o checkbox nos que queres arquivar. Na próxima corrida "
+            "(midday/evening/morning) o Carlos arquiva-os automaticamente nas "
+            "pastas correctas das respectivas contas."
+        ),
+    ]
+    for p in pending[:40]:
+        subj = (p.get("subject") or "(sem assunto)")[:120]
+        frm = (p.get("from") or "?")[:60]
+        title = f"{subj} — de {frm}"
+        url = MAIL_TOKEN_PREFIX + (p.get("token") or "")
+        blocks.append(_to_do(title[:2000], link=url, checked=False))
+    return blocks
+
+
+# ----------------------------------------------------------------------
+# Carry-over: items abertos de dias anteriores (criado_em > 24h)
+# ----------------------------------------------------------------------
+
+def _split_carryover(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(novos_hoje, carry_over). Carry-over = criado_em < hoje 00:00 UTC."""
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    novos: list[dict] = []
+    carry: list[dict] = []
+    for it in items:
+        criado = it.get("criado_em")
+        if isinstance(criado, datetime):
+            c = criado if criado.tzinfo else criado.replace(tzinfo=timezone.utc)
+            if c < today_start:
+                carry.append(it)
+            else:
+                novos.append(it)
+        else:
+            novos.append(it)
+    return novos, carry
+
+
+# ----------------------------------------------------------------------
+# Bug fix A: regenerate_dynamic_section
+# ----------------------------------------------------------------------
+
+async def _regenerate_dynamic_section(nc: NotionClient, blocks: list[dict]) -> None:
+    """Apaga blocks dinamicos preservando todo o conteudo ate ao ultimo
+    child_database (linked DB 'Tarefas Hoje (David)') no topo da pagina.
+
+    Estrategia:
+      1. GET children da pagina.
+      2. Encontrar indice do ULTIMO child_database -- esse e o anchor.
+      3. Apagar todos os blocks DEPOIS desse anchor.
+      4. Append os novos blocks.
+
+    Se nao houver child_database (primeira corrida ou pagina vazia),
+    fallback seguro: replace_page_content total.
+    """
+    try:
+        existing = await nc.get_block_children(MORNING_BRIEFING_PAGE)
+    except Exception as exc:
+        log.warning("regen.read_fail", err=str(exc))
+        # Fallback: usa replace total
+        await nc.replace_page_content(MORNING_BRIEFING_PAGE, blocks)
+        return
+
+    anchor_idx = -1
+    for idx, b in enumerate(existing):
+        if b.get("type") == "child_database":
+            anchor_idx = idx
+
+    if anchor_idx < 0:
+        log.warning("regen.no_anchor_fallback_full_replace")
+        await nc.replace_page_content(MORNING_BRIEFING_PAGE, blocks)
+        return
+
+    # Apagar tudo depois do anchor
+    to_delete = existing[anchor_idx + 1:]
+    for b in to_delete:
+        try:
+            await nc.delete_block(b["id"])
+        except Exception as exc:
+            log.warning("regen.delete_fail", block_id=b.get("id"), err=str(exc))
+
+    # Append novos blocks
+    if blocks:
+        await nc.append_blocks(MORNING_BRIEFING_PAGE, blocks)
+
+    log.info("regen.done", anchor_idx=anchor_idx, deleted=len(to_delete), appended=len(blocks))
+
+
 # ----------------------------------------------------------------------
 # Run principal
 # ----------------------------------------------------------------------
@@ -854,28 +812,69 @@ async def run() -> dict:
     ano, semana, _ = date.today().isocalendar()
     hoje_iso = date.today().isoformat()
 
+    # Step 1: sincronizar Notion->DB (checkboxes marcados manualmente)
     sincronizados = 0
-    tarefas_total = 0
-    tarefas_por_empresa: dict[str, int] = {}
-
     try:
         async with NotionClient() as nc:
             sincronizados = await _sync_notion_to_db(nc)
-            tarefas_total, tarefas_por_empresa = await _count_tarefas_hoje(nc)
     except Exception as exc:
         log.warning("notion sync FAIL", err=str(exc))
 
+    # Step 2: ler items abertos
     items = await briefing_db.list_open(limit=200)
+
+    # Step 3: stale-check (Bug B/C). Pode marcar items como done.
+    archived_externally = 0
+    try:
+        archived_externally = await _stale_check_emails(items)
+    except Exception as exc:
+        log.warning("stale_check FAIL", err=str(exc))
+
+    # Re-ler items se stale-check marcou alguns
+    if archived_externally:
+        items = await briefing_db.list_open(limit=200)
+
     stats = await briefing_db.stats_por_urgencia()
     resolvidos = await briefing_db.list_recently_resolved(hours=24, limit=20)
 
-    resumo = await _resumo_executivo(items, stats)
+    # Step 4: split carry-over vs novos
+    novos, carry = _split_carryover(items)
 
-    # ----- Conteudo dinamico (entre markers) -----
-    # NOTA Sprint 7.6: a seccao 'To-do (David)' Sprint 7 (callout link) NAO
-    # entra mais no conteudo dinamico. A sua substituicao e a vista linked
-    # database persistente acima do MARKER_START, gerida pelo setup script.
+    # Step 5: dados Redis (state)
+    try:
+        email_stats = await get_all_email_stats()
+    except Exception:
+        email_stats = {}
+    try:
+        drafts_raw = await peek_drafts()
+    except Exception:
+        drafts_raw = []
+    try:
+        invoices = await peek_invoices()
+    except Exception:
+        invoices = []
+    try:
+        manual_invoices = await peek_manual_invoices()
+    except Exception:
+        manual_invoices = []
+    try:
+        pending_emails = await peek_pending_emails()
+    except Exception:
+        pending_emails = []
+
+    drafts_by_account: dict[str, int] = {}
+    for d in drafts_raw:
+        acc = d.get("account", "")
+        drafts_by_account[acc] = drafts_by_account.get(acc, 0) + 1
+
+    # Step 6: LLM resume + prioridades
+    resumo = await _resumo_executivo(items, stats)
+    prioridades = await _prioridades_do_dia(items)
+
+    # Step 7: construir blocks
     blocks: list[dict] = [
+        # Marker invisivel para identificar inicio dos dynamic blocks
+        _paragraph(DYNAMIC_START_MARKER),
         heading(1, f"Briefing {hoje_iso}"),
         {
             "object": "block",
@@ -893,20 +892,32 @@ async def run() -> dict:
         paragraph(resumo),
     ]
 
-    # ----- Sprint 7 seccao 2: Proximos 7 dias -----
-    blocks.extend(_build_seccao_proximos_7d(items))
+    # Prioridades do dia (LLM)
+    if prioridades:
+        blocks.append(heading(2, f"🔥 Prioridades do dia ({len(prioridades)})"))
+        for p in prioridades:
+            blocks.append(_to_do(
+                p["texto"],
+                link=p.get("link_origem"),
+                checked=False,
+            ))
 
-    # ----- Cards URGENTE / ESTA SEMANA / ACOMPANHAR / BAIXA -----
-    if not items:
-        blocks.append(heading(2, "✨ Inbox limpo"))
-        blocks.append(paragraph(
-            "Sem itens abertos. Quando os workers detectarem novidades, aparecerao aqui."
-        ))
-    else:
+    # Carry-over
+    if carry:
+        blocks.append(heading(2, f"📌 Pendente dos dias anteriores  ({len(carry)})"))
+        agrupados_c: dict[str, list[dict]] = {u: [] for u in URGENCIA_MAP}
+        for it in carry:
+            agrupados_c.setdefault(it.get("urgencia", "P2"), []).append(it)
+        for urg in ("P0", "P1", "P2", "P3"):
+            seccao = agrupados_c.get(urg, [])
+            for it in seccao:
+                blocks.extend(_build_card(it))
+
+    # Cards novos por urgencia (so items criados hoje)
+    if novos:
         agrupados: dict[str, list[dict]] = {u: [] for u in URGENCIA_MAP}
-        for it in items:
+        for it in novos:
             agrupados.setdefault(it.get("urgencia", "P2"), []).append(it)
-
         for urg in ("P0", "P1", "P2", "P3"):
             seccao = agrupados.get(urg, [])
             if not seccao:
@@ -915,58 +926,70 @@ async def run() -> dict:
             blocks.append(heading(2, f"{emoji} {label}  ({len(seccao)})"))
             for it in seccao:
                 blocks.extend(_build_card(it))
+    elif not carry and not items:
+        blocks.append(heading(2, "✨ Inbox limpo"))
+        blocks.append(_paragraph(
+            "Sem itens abertos. Quando os workers detectarem novidades, aparecerao aqui."
+        ))
 
-    # ----- Sprint 7 seccao 3: Drafts pendentes -----
-    drafts_blocks = await _build_seccao_drafts()
-    if drafts_blocks:
-        blocks.append({"object": "block", "type": "divider", "divider": {}})
-        blocks.extend(drafts_blocks)
+    # Pending emails (checkbox -> auto-archive)
+    blocks.extend(_build_pending_emails(pending_emails))
 
-    # ----- Sprint 7 seccao 4: Resumo arquivo emails 24h -----
-    resumo_blocks = await _build_seccao_resumo_emails()
-    if resumo_blocks:
-        blocks.append({"object": "block", "type": "divider", "divider": {}})
-        blocks.extend(resumo_blocks)
+    # Drafts com preview + checkbox marcado respondido
+    blocks.append(_divider())
+    blocks.extend(_build_drafts_section(drafts_raw))
 
-    # ----- Sprint 7 seccao 5: Faturas arquivadas 24h -----
-    faturas_blocks = await _build_seccao_faturas()
-    if faturas_blocks:
-        blocks.append({"object": "block", "type": "divider", "divider": {}})
-        blocks.extend(faturas_blocks)
+    # Tabela 8 inboxes
+    blocks.append(_divider())
+    blocks.append(heading(2, "📊 Estado das caixas de correio"))
+    blocks.append(_paragraph(
+        "Previnsa é tratada via opaidapetinga@gmail.com (forwarding)."
+    ))
+    blocks.append(_build_email_table(email_stats, drafts_by_account))
 
-    # ----- Resolvido nas ultimas 24h (mantido) -----
+    # Faturas arquivadas hoje
+    blocks.append(_divider())
+    blocks.extend(_build_invoices_archived_today(invoices))
+
+    # Faturas pendentes manual
+    blocks.append(_divider())
+    blocks.extend(_build_manual_invoices(manual_invoices))
+
+    # Resolvido nas ultimas 24h
     if resolvidos:
-        blocks.append({"object": "block", "type": "divider", "divider": {}})
+        blocks.append(_divider())
         blocks.append(heading(2, f"✅ Resolvido nas ultimas 24h  ({len(resolvidos)})"))
         for it in resolvidos:
             blocks.append(_build_resolved_card(it))
 
-    blocks.append({"object": "block", "type": "divider", "divider": {}})
-    blocks.append(paragraph(
-        f"Sincronizacao Notion→DB: {sincronizados} item(s) marcado(s) como resolvido."
+    # Footer sync
+    blocks.append(_divider())
+    extra_archive = (
+        f" · {archived_externally} arquivado(s) externamente"
+        if archived_externally else ""
+    )
+    blocks.append(_paragraph(
+        f"Sincronização Notion→DB: {sincronizados} item(s) marcado(s) como resolvido"
+        f"{extra_archive}."
     ))
+    blocks.append(_paragraph(DYNAMIC_END_MARKER))
 
-    # ----- Regenerar area dinamica entre markers -----
-    regen_info: dict[str, Any] = {}
+    # Step 8: render -- usa regenerate_dynamic_section (Bug A fix)
     try:
         async with NotionClient() as nc:
-            regen_info = await regenerate_dynamic_section(
-                nc, MORNING_BRIEFING_PAGE, blocks
-            )
+            await _regenerate_dynamic_section(nc, blocks)
     except Exception as exc:
-        log.error("regenerate_dynamic_section FAIL", err=str(exc))
+        log.error("regen FAIL", err=str(exc))
         raise
 
+    # Step 9: log no Activity Log
     try:
         await notion_ext.create_database_row(
             data_source_id=ACTIVITY_LOG_DB,
             title=(
-                f"Briefing inbox {hoje_iso} | "
-                f"{sum(stats.values())} abertos | "
-                f"{tarefas_total} tarefas | "
-                f"{len(resolvidos)} resolvidos | "
-                f"sync={sincronizados} | "
-                f"mode={regen_info.get('mode','?')}"
+                f"Briefing inbox {hoje_iso} | {sum(stats.values())} abertos | "
+                f"{len(resolvidos)} resolvidos | sync={sincronizados} | "
+                f"stale={archived_externally}"
             ),
         )
     except Exception:
@@ -976,14 +999,17 @@ async def run() -> dict:
         "status": "ok",
         "data": hoje_iso,
         "items_abertos": sum(stats.values()),
+        "items_carry_over": len(carry),
+        "items_novos_hoje": len(novos),
         "stats": stats,
-        "tarefas_briefing": tarefas_total,
-        "tarefas_por_empresa": tarefas_por_empresa,
         "items_resolvidos_24h": len(resolvidos),
         "sincronizados_notion_db": sincronizados,
-        "regen_mode": regen_info.get("mode"),
-        "regen_deleted": regen_info.get("deleted", 0),
-        "regen_appended": regen_info.get("appended", 0),
+        "archived_externally": archived_externally,
+        "prioridades_count": len(prioridades),
+        "drafts_pending": len(drafts_raw),
+        "invoices_today": len(invoices),
+        "manual_invoices": len(manual_invoices),
+        "pending_emails": len(pending_emails),
     }
-    log.info("briefing-inbox", **out)
+    log.info("briefing-inbox v10", **out)
     return out

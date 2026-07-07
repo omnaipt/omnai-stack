@@ -86,7 +86,7 @@ async def upsert_item(item: BriefingItem) -> str:
                              END,
                 link_origem= COALESCE(EXCLUDED.link_origem, briefing_items.link_origem),
                 metadata   = COALESCE(EXCLUDED.metadata, briefing_items.metadata)
-            RETURNING id::text;
+            RETURNING id::text, (xmax = 0) AS is_new;
             """,
             item.chave,
             item.tipo,
@@ -97,6 +97,24 @@ async def upsert_item(item: BriefingItem) -> str:
             item.link_origem,
             metadata_json,
         )
+        if row and row.get("is_new") and item.urgencia == "P0":
+            import asyncio as _asyncio
+            try:
+                from services import telegram_bot as _tb
+                payload = {
+                    "id": row["id"],
+                    "chave": item.chave,
+                    "tipo": item.tipo,
+                    "urgencia": item.urgencia,
+                    "empresa": item.empresa,
+                    "titulo": item.titulo,
+                    "detalhe": item.detalhe,
+                    "link_origem": item.link_origem,
+                }
+                logger.info("briefing.p0_alert_dispatch id=%s", row["id"])
+                _asyncio.create_task(_tb.send_p0_alert(payload))
+            except Exception as exc:
+                logger.warning("briefing.p0_alert_failed err=%s", exc)
         return row["id"] if row else ""
 
 

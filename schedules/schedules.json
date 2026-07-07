@@ -11,8 +11,8 @@
   {
     "taskId": "briefing-carlos",
     "description": "Briefing Carlos: gmail-multi-mcp + calendário + Notion + arquivo automático + download faturas Drive",
-    "schedule": "At 08:18 AM, Monday through Friday",
-    "cronExpression": "15 8 * * 1-5",
+    "schedule": "At 08:00 AM, every day",
+    "cronExpression": "0 8 * * *",
     "timezone": "Europe/Lisbon",
     "owner": "carlos",
     "enabled": true
@@ -132,7 +132,7 @@
     "cronExpression": "0 8 * * 1-5",
     "timezone": "Europe/Lisbon",
     "owner": "carlos",
-    "enabled": true
+    "enabled": false
   },
   {
     "taskId": "inbox-sweep-midday",

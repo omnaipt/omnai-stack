@@ -30,6 +30,7 @@ from typing import Any
 import structlog
 
 from services.llm import generate
+from services import learned_rules_db
 
 log = structlog.get_logger()
 
@@ -108,6 +109,76 @@ def _strip_json(text: str) -> str:
 
 
 VALID_CLASSES = {"actionable", "invoice", "archive", "delete", "keep"}
+
+# =========================================================================
+# v9.6: regras determinísticas pré-LLM (evita falsos positivos de invoice)
+# =========================================================================
+
+# v9.6.1: keywords que FORCAM invoice (override blacklists)
+_FORCE_RULES_INVOICE_KEYWORDS = [
+    re.compile(r"\bfactura[-\s]?recibo\b", re.I),
+    re.compile(r"\bfatura[-\s]?recibo\b", re.I),
+    re.compile(r"\bsua\s+factura\b", re.I),
+    re.compile(r"\bsua\s+fatura\b", re.I),
+    re.compile(r"\bsua\s+nova\s+factura\b", re.I),
+    re.compile(r"\bnota\s+de\s+(d[ée]bito|cr[ée]dito)\b", re.I),
+    re.compile(r"\brecibo\s+verde\b", re.I),
+    re.compile(r"\brecibo\s+electr[óo]nico\b", re.I),
+    re.compile(r"\bfacture\s+n[ºo°]\b", re.I),
+    re.compile(r"\binvoice\s+attached\b", re.I),
+    re.compile(r"\bnova\s+factura\s+da\b", re.I),
+    re.compile(r"\bproof\s+of\s+payment\b", re.I),
+]
+
+_FORCE_RULES_SENDER = [
+    (re.compile(r"failed-payments?@", re.I), "actionable"),
+    (re.compile(r"upcoming-invoice\+.*@stripe\.com", re.I), "archive"),
+    (re.compile(r"payments-noreply@google\.com", re.I), "keep"),
+    (re.compile(r"no-reply@(accounts\.)?google\.com", re.I), "delete"),
+]
+
+_FORCE_RULES_SUBJECT = [
+    (re.compile(r"\b(payment|pagamento).{0,40}(unsuccessful|failed|falh|declined|recusad)", re.I), "actionable"),
+    (re.compile(r"\$\d+.*(unsuccessful|failed)", re.I), "actionable"),
+    (re.compile(r"€\d+.*(unsuccessful|failed)", re.I), "actionable"),
+    (re.compile(r"(upcoming|próxim).{0,25}(invoice|fatura)", re.I), "archive"),
+    (re.compile(r"será renovada em breve", re.I), "archive"),
+    (re.compile(r"will (be )?renew", re.I), "archive"),
+    (re.compile(r"renewal (reminder|in \d+)", re.I), "archive"),
+    (re.compile(r"validar.{0,20}identidade", re.I), "keep"),
+    (re.compile(r"verify.{0,20}identity", re.I), "keep"),
+]
+
+
+def _force_class_from_rules(subject: str, from_addr: str) -> dict | None:
+    """v9.6.1 deterministic pre-filter. Invoice keywords tem prioridade absoluta."""
+    # PRIORIDADE 1: invoice keywords no subject (override qualquer blacklist)
+    if subject:
+        for rx in _FORCE_RULES_INVOICE_KEYWORDS:
+            if rx.search(subject):
+                return {
+                    "classification": "invoice",
+                    "reason": f"force.invoice_keyword:{rx.pattern[:40]}",
+                    "confidence": 0.99,
+                }
+    if from_addr:
+        for rx, klass in _FORCE_RULES_SENDER:
+            if rx.search(from_addr):
+                return {
+                    "classification": klass,
+                    "reason": f"force.sender:{rx.pattern[:40]}",
+                    "confidence": 0.98,
+                }
+    if subject:
+        for rx, klass in _FORCE_RULES_SUBJECT:
+            if rx.search(subject):
+                return {
+                    "classification": klass,
+                    "reason": f"force.subject:{rx.pattern[:40]}",
+                    "confidence": 0.97,
+                }
+    return None
+
 
 # =========================================================================
 # Enderecos do David (usados para "direct to me" check)
@@ -542,6 +613,25 @@ async def classify(
     headers: dict | None = None,
     to_addr: str = "",
 ) -> dict[str, Any]:
+    # v9.6: regras aprendidas (DB) primeiro
+    learned = learned_rules_db.check(subject, from_addr)
+    if learned is not None:
+        cls, rule_id = learned
+        try:
+            await learned_rules_db.record_hit(rule_id)
+        except Exception:
+            pass
+        log.info("classify.learned", cls=cls, rule_id=rule_id, from_=from_addr[:40])
+        return {"classification": cls, "reason": f"learned_rule:{rule_id[:8]}", "confidence": 0.99}
+    forced = _force_class_from_rules(subject, from_addr)
+    if forced is not None:
+        log.info(
+            "classify.forced",
+            cls=forced["classification"],
+            reason=forced.get("reason"),
+            from_=from_addr[:40],
+        )
+        return forced
     heur = heuristic_classify(from_addr, subject, body, headers, to_addr)
     if heur is not None:
         log.info(

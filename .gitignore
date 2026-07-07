@@ -43,3 +43,7 @@ uptime_kuma_data/
 # Logs
 *.log
 logs/
+
+# Backups adicionais (snapshot 2026-07-07)
+*.bak
+*.pre*.bak

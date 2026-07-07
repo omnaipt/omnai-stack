@@ -70,6 +70,10 @@ services:
       SCAN_MODE: ${SCAN_MODE:-balanced}
       SCAN_DRY_RUN: ${SCAN_DRY_RUN:-false}
       SCAN_CAP: ${SCAN_CAP:-50}
+      ACTIONS_BASE_URL: ${ACTIONS_BASE_URL:-https://agents.omnai.pt}
+      ACTION_TOKEN_SECRET: ${ACTION_TOKEN_SECRET}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET}
       TZ: Europe/Lisbon
     volumes:
       - ./agents:/app

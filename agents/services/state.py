@@ -1,4 +1,8 @@
-"""Estado partilhado via Redis: email stats, drafts, faturas."""
+"""Estado partilhado via Redis: email stats, drafts, faturas.
+
+Sprint 9: nova funcao pop_draft_by_id para apagar draft individual quando
+o David clica [Marcado respondido] no card do briefing.
+"""
 from __future__ import annotations
 
 import json
@@ -43,20 +47,23 @@ async def get_all_email_stats() -> dict[str, dict[str, str]]:
 
 # ---- Drafts de resposta ----
 
+DRAFTS_KEY = "omnai:email:drafts"
+
+
 async def push_draft(draft: dict[str, Any]) -> None:
     c = _c()
     if c is None:
         return
-    await c.lpush("omnai:email:drafts", json.dumps(draft, ensure_ascii=False))
-    await c.ltrim("omnai:email:drafts", 0, 49)
-    await c.expire("omnai:email:drafts", 60 * 60 * 36)
+    await c.lpush(DRAFTS_KEY, json.dumps(draft, ensure_ascii=False))
+    await c.ltrim(DRAFTS_KEY, 0, 49)
+    await c.expire(DRAFTS_KEY, 60 * 60 * 36)
 
 
 async def peek_drafts() -> list[dict[str, Any]]:
     c = _c()
     if c is None:
         return []
-    raw = await c.lrange("omnai:email:drafts", 0, -1)
+    raw = await c.lrange(DRAFTS_KEY, 0, -1)
     return [json.loads(x) for x in raw]
 
 
@@ -64,9 +71,30 @@ async def pop_drafts() -> list[dict[str, Any]]:
     c = _c()
     if c is None:
         return []
-    raw = await c.lrange("omnai:email:drafts", 0, -1)
-    await c.delete("omnai:email:drafts")
+    raw = await c.lrange(DRAFTS_KEY, 0, -1)
+    await c.delete(DRAFTS_KEY)
     return [json.loads(x) for x in raw]
+
+
+async def pop_draft_by_id(draft_id: str) -> dict[str, Any] | None:
+    """Sprint 9: remove draft individual de Redis pelo draft_id.
+
+    Devolve dict com {draft_id, gmail_message_id, account/inbox, ...} ou None
+    se nao encontrar. Usado por /actions/draft-done.
+    """
+    c = _c()
+    if c is None or not draft_id:
+        return None
+    raw = await c.lrange(DRAFTS_KEY, 0, -1)
+    for item in raw:
+        try:
+            d = json.loads(item)
+        except Exception:
+            continue
+        if d.get("draft_id") == draft_id:
+            await c.lrem(DRAFTS_KEY, 1, item)
+            return d
+    return None
 
 
 # ---- Faturas arquivadas hoje ----

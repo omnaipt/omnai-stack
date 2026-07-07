@@ -1,4 +1,4 @@
-"""Worker email-scan v0.7.0 (Sprint 7.5).
+"""Worker email-scan v0.6.0 (Sprint 5).
 
 Fluxo por cada email:
   classify -> {actionable, invoice, archive, delete, keep}
@@ -11,13 +11,6 @@ Fluxo por cada email:
 
 Sprint 5: emite cards em briefing_items para itens accionaveis e faturas
 processadas/falhadas, sem mexer no resto do pipeline.
-
-Sprint 7.5: filtra cards `email_fatura_pendente` (e quaisquer outros
-contabilisticos) por responsabilidade contabilistica do David. Cards
-`email_actionable` mantem-se intocados (alertam para todas as empresas:
-sao operacionais, nao contabilisticos). O pipeline de processamento de
-fatura (push_invoice, push_manual_invoice, archive, etc.) tambem fica
-inalterado: o filtro so evita criar o CARD no briefing_items.
 """
 from __future__ import annotations
 
@@ -32,12 +25,12 @@ from services import gmail, imap_client
 from services.briefing_emit import emit_briefing
 from services.classifier import classify, extract_email
 from services.drafter import draft_response
+from services import email_inbox_db
 from services.invoices import (
     company_for_inbox,
     extract_metadata,
     save_invoice_pdf,
 )
-from services.responsabilidade_david import is_alerta_relevante
 from services.state import (
     push_pending_email,
     push_draft, push_invoice, push_manual_invoice, set_email_stats,
@@ -49,8 +42,6 @@ log = structlog.get_logger()
 import base64 as _b64
 
 WORKER_NAME = "email-scan"
-TIPO_ACTIONABLE = "email_actionable"  # NAO filtrado: alerta sempre
-TIPO_FATURA_PENDENTE = "email_fatura_pendente"  # filtrado por escopo David
 
 
 def _mk_pending_token(account: str, msg_id: str) -> str:
@@ -251,15 +242,24 @@ async def _create_gmail_draft_for(account: str, summary: dict, reason: str) -> N
 
 
 async def _emit_actionable_card(account: str, msg_id: str, subject: str, from_addr: str, reason: str) -> None:
-    """Card email_actionable: NAO filtrado por escopo de contabilidade.
-
-    Sprint 7.5: este tipo continua a alertar para TODAS as empresas, porque
-    e operacional (resposta a fornecedor, decisao comercial), nao contabilistico.
-    """
     titulo = (subject or "(sem assunto)")[:180]
     detalhe = f"De: {from_addr or '(desconhecido)'}\nMotivo classificador: {reason or '-'}"
+    # v9.7: persist no email_inbox para a tab Emails da PWA
+    try:
+        await email_inbox_db.upsert(
+            account=account,
+            message_id=msg_id,
+            thread_id=None,
+            from_addr=from_addr or "",
+            subject=subject or "",
+            snippet=(reason or "")[:500],
+            classificacao="actionable",
+            gmail_thread_url=gmail.get_message_url(account, msg_id) if hasattr(gmail, "get_message_url") else None,
+        )
+    except Exception as exc:
+        log.warning("email_inbox.upsert_failed", err=str(exc))
     await emit_briefing(
-        tipo=TIPO_ACTIONABLE,
+        tipo="email_actionable",
         titulo=titulo,
         detalhe=detalhe,
         urgencia="P1",
@@ -267,6 +267,8 @@ async def _emit_actionable_card(account: str, msg_id: str, subject: str, from_ad
         chave_parts=(msg_id,),
         link_origem=gmail.get_message_url(account, msg_id),
         metadata={
+            "gmail_message_id": msg_id,
+            "gmail_inbox": account,
             "account": account,
             "from": (from_addr or "")[:200],
             "subject": (subject or "")[:200],
@@ -277,33 +279,19 @@ async def _emit_actionable_card(account: str, msg_id: str, subject: str, from_ad
 
 
 async def _emit_invoice_pendente_card(account: str, msg_id: str, subject: str, from_addr: str, reason: str, link: str) -> None:
-    """Card email_fatura_pendente: FILTRADO por escopo de contabilidade David.
-
-    Sprint 7.5: so emite para OMNAI, Sopato e Pessoal. Para Previnsa e
-    JMSoares a fatura continua a entrar na manual_invoices queue (decisao
-    feita upstream em process_gmail/imap), mas nao gera card no briefing.
-    """
-    empresa = _empresa_para_card(account)
-    if not is_alerta_relevante(tipo=TIPO_FATURA_PENDENTE, empresa=empresa):
-        log.debug(
-            "skip emit_briefing",
-            tipo=TIPO_FATURA_PENDENTE,
-            empresa=empresa,
-            account=account,
-            reason="fora_responsabilidade_david",
-        )
-        return
     titulo = f"Fatura por extrair: {subject or '(sem assunto)'}"[:180]
     detalhe = f"De: {from_addr or '(desconhecido)'}\nMotivo: {reason or '-'}"
     await emit_briefing(
-        tipo=TIPO_FATURA_PENDENTE,
+        tipo="email_fatura_pendente",
         titulo=titulo,
         detalhe=detalhe,
         urgencia="P1",
-        empresa=empresa,
+        empresa=_empresa_para_card(account),
         chave_parts=(msg_id, "fatura"),
         link_origem=link or gmail.get_message_url(account, msg_id),
         metadata={
+            "gmail_message_id": msg_id,
+            "gmail_inbox": account,
             "account": account,
             "from": (from_addr or "")[:200],
             "subject": (subject or "")[:200],
@@ -351,7 +339,9 @@ async def process_gmail(account: str) -> dict[str, Any]:
                     summary.get("subject", ""), summary.get("from", ""), reason,
                 )
                 if not (SCAN_DRY_RUN or not policy["draft"]):
-                    await _create_gmail_draft_for(account, summary, reason)
+                    # v9.7: draft on-demand via PWA, nao gerado automaticamente
+
+                    log.info("draft.skipped", reason="on_demand_via_pwa", account=account)
 
             elif classification == "invoice":
                 if SCAN_DRY_RUN or not policy["invoice"]:
