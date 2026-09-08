@@ -45,7 +45,7 @@ log = structlog.get_logger()
 
 router = APIRouter()
 
-SERVER_INFO = {"name": "omnai-stack", "version": "1.0.0"}
+SERVER_INFO = {"name": "omnai-stack", "version": "1.1.0"}
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 SECRETS_DIR = Path(os.getenv("SECRETS_DIR", "/secrets"))
 TOKEN_FILE = SECRETS_DIR / "mcp_token.txt"
@@ -476,6 +476,83 @@ TOOLS: list[dict] = [
         "description": "Dados de identificacao das empresas (NIF, morada, contabilista, bancos...) guardados na app.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    {
+        "name": "revolut_status",
+        "description": "Estado da ligacao ao Revolut Business (OMNAI): configurado? contas e saldos.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "revolut_sync",
+        "description": "Importa agora os movimentos Revolut dos ultimos N dias e reconcilia com as faturas. Escrita (tabela movimentos_bancarios).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"dias": {"type": "integer", "default": 45, "minimum": 1, "maximum": 400}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "movimentos",
+        "description": "Movimentos bancarios importados do Revolut. Filtros: mes 'YYYY-MM', categoria (despesa|receita|interno|taxa|cambio|reembolso), match_estado (por_casar|casado|sem_fatura|nao_precisa|ignorado).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mes": {"type": "string"},
+                "categoria": {"type": "string"},
+                "match_estado": {"type": "string"},
+                "limit": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "movimentos_sem_fatura",
+        "description": "Atalho: despesas Revolut de um mes sem fatura no indice (o que a contabilidade vai pedir), mais o resumo do mes por categoria.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"mes": {"type": "string", "description": "YYYY-MM"}},
+            "required": ["mes"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "movimento_marcar",
+        "description": "Marca um movimento: casado (com fatura_id), sem_fatura, nao_precisa, ignorado. Escrita.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "movimento_id": {"type": "string"},
+                "match_estado": {"type": "string", "enum": ["casado", "sem_fatura", "nao_precisa", "ignorado", "por_casar"]},
+                "fatura_id": {"type": "string"},
+                "nota": {"type": "string"},
+            },
+            "required": ["movimento_id", "match_estado"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "moloni_status",
+        "description": "Estado da ligacao ao Moloni (faturacao OMNAI): configurado? empresas.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "moloni_documentos",
+        "description": "Documentos emitidos no Moloni (faturas, recibos, notas) num mes 'YYYY-MM'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"mes": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "moloni_pdf",
+        "description": "Texto e link do PDF de um documento Moloni (document_id).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"document_id": {"type": "integer"}},
+            "required": ["document_id"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -628,7 +705,90 @@ async def _t_empresas_dados(_: dict) -> Any:
     return por_empresa
 
 
+async def _t_revolut_status(_: dict) -> Any:
+    from services import revolut
+    if not revolut.configured():
+        return {"configured": False,
+                "como_ligar": "na VPS: ./agents/scripts/revolut_setup.sh cert, depois client <id>, depois consentimento"}
+    r = await asyncio.to_thread(revolut.test_connection)
+    return {"configured": True, **r}
+
+
+async def _t_revolut_sync(a: dict) -> Any:
+    from workers import revolut_sync
+    from services import revolut
+    if not revolut.configured():
+        return {"error": "revolut nao configurado"}
+    return await revolut_sync.sync(int(a.get("dias") or 45))
+
+
+async def _t_movimentos(a: dict) -> Any:
+    from services import movimentos_db
+    rows = await movimentos_db.listar(mes=a.get("mes"), categoria=a.get("categoria"),
+                                      match_estado=a.get("match_estado"),
+                                      limit=int(a.get("limit") or 200))
+    return {"count": len(rows), "items": rows}
+
+
+async def _t_movimentos_sem_fatura(a: dict) -> Any:
+    from services import movimentos_db
+    rows = await movimentos_db.listar(mes=a["mes"], categoria="despesa",
+                                      match_estado="sem_fatura", limit=500)
+    resumo = await movimentos_db.resumo_mes(a["mes"])
+    internos = await movimentos_db.listar(mes=a["mes"], categoria="interno", limit=100)
+    return {"mes": a["mes"], "sem_fatura": rows, "transferencias_internas": internos,
+            "resumo": resumo["linhas"]}
+
+
+async def _t_movimento_marcar(a: dict) -> Any:
+    from services import movimentos_db
+    ok = await movimentos_db.marcar(a["movimento_id"], a["match_estado"],
+                                    fatura_id=a.get("fatura_id"), nota=a.get("nota"))
+    return {"ok": bool(ok)}
+
+
+async def _t_moloni_status(_: dict) -> Any:
+    from services import moloni
+    if not moloni.configured():
+        return {"configured": False,
+                "como_ligar": "/secrets/moloni.json com client_id, client_secret (Area de Cliente > Programadores), username, password"}
+    r = await asyncio.to_thread(moloni.test_connection)
+    return {"configured": True, **r}
+
+
+async def _t_moloni_documentos(a: dict) -> Any:
+    from services import moloni
+    if not moloni.configured():
+        return {"error": "moloni nao configurado"}
+    docs = await asyncio.to_thread(moloni.documents, a.get("mes"))
+    return {"count": len(docs), "documentos": docs}
+
+
+async def _t_moloni_pdf(a: dict) -> Any:
+    from services import moloni
+    if not moloni.configured():
+        return {"error": "moloni nao configurado"}
+    url = await asyncio.to_thread(moloni.document_pdf_link, int(a["document_id"]))
+    out: dict[str, Any] = {"document_id": a["document_id"], "url": url}
+    if url:
+        import httpx
+        def _dl():
+            with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+                return c.get(url).content
+        data = await asyncio.to_thread(_dl)
+        out["text"] = _pdf_text(data)
+    return out
+
+
 HANDLERS = {
+    "revolut_status": _t_revolut_status,
+    "revolut_sync": _t_revolut_sync,
+    "movimentos": _t_movimentos,
+    "movimentos_sem_fatura": _t_movimentos_sem_fatura,
+    "movimento_marcar": _t_movimento_marcar,
+    "moloni_status": _t_moloni_status,
+    "moloni_documentos": _t_moloni_documentos,
+    "moloni_pdf": _t_moloni_pdf,
     "list_accounts": _t_list_accounts,
     "search_mail": _t_search_mail,
     "get_thread": _t_get_thread,
@@ -771,3 +931,22 @@ async def mcp_delete(request: Request, path_token: str | None = None) -> Respons
     if not _authorized(request, path_token):
         return _unauthorized()
     return Response(status_code=204)
+
+
+@router.get("/revolut/callback")
+async def revolut_callback(code: str = "", error: str = "") -> Response:
+    """Redirect URI do consentimento Revolut. Troca o code por tokens na hora,
+    porque o code so vale 2 minutos. Um code falso falha no Revolut; nao ha
+    nada a proteger aqui alem do proprio code, que so o David recebe."""
+    from fastapi.responses import HTMLResponse
+    from services import revolut
+    if error or not code:
+        return HTMLResponse(f"<h2>Revolut: sem code ({error or 'vazio'})</h2>", status_code=400)
+    try:
+        r = await asyncio.to_thread(revolut.exchange_code, code)
+        t = await asyncio.to_thread(revolut.test_connection)
+        return HTMLResponse(
+            "<h2>Revolut ligado.</h2><pre>" + _dumps({"tokens": r, "teste": t}) + "</pre>")
+    except Exception as exc:
+        log.exception("revolut.callback")
+        return HTMLResponse(f"<h2>Falhou</h2><pre>{type(exc).__name__}: {exc}</pre>", status_code=500)

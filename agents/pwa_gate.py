@@ -34,7 +34,7 @@ SECRETS_DIR = Path(os.getenv("SECRETS_DIR", "/secrets"))
 CONFIG_FILE = SECRETS_DIR / "pwa_gate.json"
 COOKIE = "omnai_sessao"
 VALIDADE_S = 90 * 24 * 3600
-EXEMPT_PREFIXES = ("/health", "/actions/", "/api/telegram/", "/mcp",
+EXEMPT_PREFIXES = ("/health", "/actions/", "/api/telegram/", "/mcp", "/revolut/callback",
                    "/static/", "/entrar", "/sair")
 EXEMPT_EXACT = ("/manifest.json", "/sw.js", "/favicon.ico", "/instalar")
 

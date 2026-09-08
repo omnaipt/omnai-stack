@@ -120,9 +120,8 @@ gmail.download_attachment = lambda a, m, i: b"%PDF-1.4 fake"
 gmail.test_connection = lambda a: {"ok": True, "email": a}
 gmail.create_draft = lambda *a, **k: {"id": "d1", "message": {"id": "dm1"}}
 
-services = types.ModuleType("services")
+import services  # noqa: E402  (pacote real, so o gmail e stub)
 services.gmail = gmail
-sys.modules["services"] = services
 sys.modules["services.gmail"] = gmail
 
 from fastapi import FastAPI  # noqa: E402
