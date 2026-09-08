@@ -1,0 +1,10 @@
+
+
+# ====== 08-09-2026: servidor MCP + portao de sessao da PWA ======
+# mcp_server: Claude (claude.ai / Cowork / Code) le as caixas Gmail, faturas,
+# fila Hoje e tarefas por JSON-RPC em /mcp, com token em /secrets/mcp_token.txt.
+# pwa_gate: fecha a app ao publico quando existir /secrets/pwa_gate.json.
+from mcp_server import router as _mcp_router  # noqa: E402
+app.include_router(_mcp_router)
+import pwa_gate as _pwa_gate  # noqa: E402
+_pwa_gate.install(app)
