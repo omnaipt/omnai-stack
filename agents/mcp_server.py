@@ -45,7 +45,7 @@ log = structlog.get_logger()
 
 router = APIRouter()
 
-SERVER_INFO = {"name": "omnai-stack", "version": "1.1.0"}
+SERVER_INFO = {"name": "omnai-stack", "version": "1.2.0"}
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 SECRETS_DIR = Path(os.getenv("SECRETS_DIR", "/secrets"))
 TOKEN_FILE = SECRETS_DIR / "mcp_token.txt"
@@ -553,10 +553,87 @@ TOOLS: list[dict] = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "fecho_pacote",
+        "description": "Monta o pacote mensal para a contabilidade (facturas validadas, extrato Revolut CSV, "
+                       "documentos Moloni, resumo) na pasta Drive <Empresa>/Fecho/<mes> e cria rascunho de email "
+                       "na caixa OMNAI. Nunca envia. mes 'YYYY-MM' (defeito: mes anterior). "
+                       "subir_drive=false so calcula o resumo.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"empresa": {"type": "string", "default": "OMNAI"},
+                           "mes": {"type": "string"},
+                           "criar_rascunho": {"type": "boolean", "default": True},
+                           "subir_drive": {"type": "boolean", "default": True}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "fecho_marcar_entregues",
+        "description": "Marca como 'entregue' as facturas validadas de uma empresa num mes, depois de o pacote "
+                       "ter sido enviado a contabilidade.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"empresa": {"type": "string"}, "mes": {"type": "string"}},
+            "required": ["empresa", "mes"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "resposta_contabilidade",
+        "description": "Le um email da contabilidade (texto, PDFs e imagens coladas), extrai os pedidos, verifica "
+                       "cada um contra faturas, Revolut e Moloni, e cria rascunho de resposta na thread (caixa OMNAI). "
+                       "Sem message_id, trata os emails recentes de @eugest.pt ainda nao tratados. "
+                       "criar_rascunho=false devolve so a analise e o texto proposto.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string"},
+                           "account": {"type": "string"},
+                           "criar_rascunho": {"type": "boolean", "default": True}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "arquivo_verificar",
+        "description": "Reconstroi o indice de hashes do arquivo (dedup por conteudo) e reindexa a tabela faturas "
+                       "(recibos e avisos de destinatario). Devolve contagens.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
 ]
 
 
 # ------------------------------------------------------ tool handlers
+
+async def _t_fecho_pacote(a: dict) -> Any:
+    from workers import fecho_pacote
+    return await fecho_pacote.montar(a.get("empresa") or "OMNAI", a.get("mes"),
+                                     criar_rascunho=a.get("criar_rascunho", True),
+                                     subir_drive=a.get("subir_drive", True))
+
+
+async def _t_fecho_marcar_entregues(a: dict) -> Any:
+    from services import faturas_db
+    itens = await faturas_db.para_pacote(a["empresa"], a["mes"])
+    n = await faturas_db.marcar_entregues([str(i["id"]) for i in itens])
+    return {"empresa": a["empresa"], "mes": a["mes"], "marcadas": n}
+
+
+async def _t_resposta_contabilidade(a: dict) -> Any:
+    from workers import resposta_contabilidade as rc
+    if a.get("message_id"):
+        cfg = rc.config()
+        return await rc.tratar_mensagem(a.get("account") or cfg["conta"], a["message_id"],
+                                        cfg["empresa"], criar_rascunho=a.get("criar_rascunho", True))
+    return await rc.run(criar_rascunho=a.get("criar_rascunho", True))
+
+
+async def _t_arquivo_verificar(_: dict) -> Any:
+    from services import invoices, faturas_index
+    novos_hashes = await asyncio.to_thread(invoices.reconstruir_hashes)
+    idx = await faturas_index.indexar()
+    rev = await faturas_index.rever_existentes()
+    return {"hashes_novos": novos_hashes, **idx, "revisao": rev}
+
 
 async def _t_list_accounts(_: dict) -> Any:
     gm = _gmail()
@@ -805,6 +882,10 @@ HANDLERS = {
     "list_tarefas": _t_list_tarefas,
     "criar_tarefa": _t_criar_tarefa,
     "empresas_dados": _t_empresas_dados,
+    "fecho_pacote": _t_fecho_pacote,
+    "fecho_marcar_entregues": _t_fecho_marcar_entregues,
+    "resposta_contabilidade": _t_resposta_contabilidade,
+    "arquivo_verificar": _t_arquivo_verificar,
 }
 
 

@@ -23,6 +23,9 @@ SCOPES = [
 ]
 
 GMAIL_ACCOUNTS: dict[str, str] = {
+    # 31-07-2026: david.sardinha@omnai.pt passou de IMAP para Gmail API.
+    # E conta Workspace; o IMAP com app password recusava com Invalid credentials.
+    "david.sardinha@omnai.pt": "david_sardinha_at_omnai_pt",
     "davidsardinhalves@gmail.com": "davidsardinhalves_at_gmail_com",
     "sopato.cascais@gmail.com": "sopato_cascais_at_gmail_com",
     "opaidapetinga@gmail.com": "opaidapetinga_at_gmail_com",

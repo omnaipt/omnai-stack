@@ -1,6 +1,8 @@
 """Acesso a tabela briefing_items (Postgres).
 
 v9.2.1: nova funcao list_recently_resolved para mostrar 'Resolvido hoje'.
+v9.8.1: expire_overdue_concursos + escalate_concursos_by_prazo
+        (briefing accionavel: auto-expiracao e escalacao por prazo).
 """
 from __future__ import annotations
 
@@ -86,7 +88,7 @@ async def upsert_item(item: BriefingItem) -> str:
                              END,
                 link_origem= COALESCE(EXCLUDED.link_origem, briefing_items.link_origem),
                 metadata   = COALESCE(EXCLUDED.metadata, briefing_items.metadata)
-            RETURNING id::text;
+            RETURNING id::text, (xmax = 0) AS is_new;
             """,
             item.chave,
             item.tipo,
@@ -97,6 +99,24 @@ async def upsert_item(item: BriefingItem) -> str:
             item.link_origem,
             metadata_json,
         )
+        if row and row.get("is_new") and item.urgencia == "P0":
+            import asyncio as _asyncio
+            try:
+                from services import telegram_bot as _tb
+                payload = {
+                    "id": row["id"],
+                    "chave": item.chave,
+                    "tipo": item.tipo,
+                    "urgencia": item.urgencia,
+                    "empresa": item.empresa,
+                    "titulo": item.titulo,
+                    "detalhe": item.detalhe,
+                    "link_origem": item.link_origem,
+                }
+                logger.info("briefing.p0_alert_dispatch id=%s", row["id"])
+                _asyncio.create_task(_tb.send_p0_alert(payload))
+            except Exception as exc:
+                logger.warning("briefing.p0_alert_failed err=%s", exc)
         return row["id"] if row else ""
 
 
@@ -131,6 +151,61 @@ async def list_recently_resolved(hours: int = 24, limit: int = 50) -> list[dict]
             limit,
         )
         return [dict(r) for r in rows]
+
+
+async def expire_overdue_concursos() -> int:
+    """Dismiss automatico de concursos cujo prazo de propostas ja passou.
+
+    Marca status='dismissed' + resolvido_em=NOW() e regista
+    metadata.auto_expired=true para telemetria. So considera valores de
+    metadata->>'prazo_propostas' em formato ISO (YYYY-MM-DD); valores
+    como 'sem prazo' sao ignorados. COALESCE protege metadata NULL.
+
+    Devolve o numero de linhas expiradas. Chamado diariamente pelo
+    briefing-inbox ANTES de list_open (e antes de escalate_concursos_by_prazo).
+    """
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE briefing_items
+               SET status = 'dismissed', resolvido_em = NOW(),
+                   metadata = COALESCE(metadata, '{}'::jsonb) || '{"auto_expired": true}'::jsonb
+             WHERE tipo = 'concurso_novo'
+               AND status IN ('open', 'snoozed')
+               AND metadata->>'prazo_propostas' ~ '^\\d{4}-\\d{2}-\\d{2}$'
+               AND (metadata->>'prazo_propostas')::date < CURRENT_DATE
+            """
+        )
+        return int(result.split()[-1])
+
+
+async def escalate_concursos_by_prazo(dias: int = 5) -> int:
+    """Escala para P0 concursos abertos a <= `dias` dias do prazo.
+
+    Complementa o modelo 'tudo entra P2' do scan-concursos-publicos: a
+    urgencia sobe por proximidade real do prazo, nao a entrada. Correr
+    DEPOIS de expire_overdue_concursos (a ordem importa: expirar primeiro,
+    escalar depois, senao escala-se concursos ja vencidos).
+
+    Devolve o numero de linhas escaladas.
+    """
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE briefing_items
+               SET urgencia = 'P0'
+             WHERE tipo = 'concurso_novo'
+               AND status IN ('open', 'snoozed')
+               AND urgencia <> 'P0'
+               AND metadata->>'prazo_propostas' ~ '^\\d{4}-\\d{2}-\\d{2}$'
+               AND (metadata->>'prazo_propostas')::date >= CURRENT_DATE
+               AND (metadata->>'prazo_propostas')::date <= CURRENT_DATE + $1::int
+            """,
+            dias,
+        )
+        return int(result.split()[-1])
 
 
 async def mark_done(item_id: str) -> bool:
@@ -241,3 +316,70 @@ async def stats_por_empresa() -> dict[str, int]:
             """
         )
         return {r["empresa"]: r["n"] for r in rows}
+
+
+async def list_hoje(limit: int = 60) -> list[dict]:
+    """Fila unica do ecra Hoje, ordenada por urgencia de prazo e tempo de espera.
+
+    Os casts sao guardados por regex porque metadata guarda texto livre:
+    prazo_propostas pode ser "sem prazo" e email_date pode nao existir.
+    """
+    pool = await _get_pool()
+    sql = """
+        SELECT id, tipo, urgencia, empresa, titulo, detalhe, link_origem,
+               metadata, criado_em,
+               COALESCE(
+                   CASE WHEN metadata->>'email_date' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+                        THEN (metadata->>'email_date')::timestamptz END,
+                   criado_em
+               ) AS espera_desde,
+               CASE WHEN metadata->>'prazo_propostas' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                    THEN (metadata->>'prazo_propostas')::date END AS prazo
+          FROM briefing_items
+         WHERE status = 'open'
+           AND (snooze_until IS NULL OR snooze_until <= now())
+         ORDER BY
+           CASE WHEN urgencia = 'P0' THEN 0 ELSE 1 END,
+           CASE WHEN urgencia = 'P0'
+                THEN COALESCE(
+                    CASE WHEN metadata->>'prazo_propostas' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                         THEN (metadata->>'prazo_propostas')::date END,
+                    DATE '2099-12-31')
+                ELSE DATE '1900-01-01' END ASC,
+           COALESCE(
+               CASE WHEN metadata->>'email_date' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+                    THEN (metadata->>'email_date')::timestamptz END,
+               criado_em
+           ) ASC
+         LIMIT $1
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, limit)
+        return [dict(r) for r in rows]
+
+
+async def sincronizar_email_inbox(item_id: str, novo_estado: str) -> int:
+    """Propaga a resolucao de um cartao para a linha correspondente em email_inbox.
+
+    Sem isto as duas tabelas divergem: o cartao sai do ecra Hoje mas o email
+    continua 'pending' no separador Emails (31-07-2026: 43 casos acumulados).
+    """
+    if novo_estado not in ("done", "dismissed"):
+        return 0
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE email_inbox ei
+               SET status = $2, resolvido_em = NOW(), actualizado_em = NOW()
+              FROM briefing_items bi
+             WHERE bi.id = $1::uuid
+               AND ei.message_id = bi.metadata->>'gmail_message_id'
+               AND ei.status = 'pending'
+            """,
+            item_id, novo_estado,
+        )
+        try:
+            return int(result.rsplit(" ", 1)[-1])
+        except Exception:
+            return 0

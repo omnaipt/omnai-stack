@@ -33,7 +33,11 @@ log = structlog.get_logger()
 
 SECRETS_DIR = Path(os.getenv("SECRETS_DIR", "/secrets"))
 TOKENS_DIR = SECRETS_DIR / "tokens"
-DRIVE_TOKEN_FILE = TOKENS_DIR / "drive_davidsardinhalves.json"
+# 03-08-2026: conta OMNAI. O ficheiro pode ser trocado por ambiente
+# sem tocar no codigo, que e o que faltava da ultima vez que o token
+# expirou.
+DRIVE_TOKEN_FILE = TOKENS_DIR / os.getenv(
+    "DRIVE_TOKEN_FILE", "drive_david_sardinha_at_omnai_pt.json")
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
@@ -130,17 +134,62 @@ def _ensure_folder(svc, name: str, parent_id: Optional[str], cache: dict[str, st
     return fid
 
 
-def ensure_invoice_folder(company: str, quarter: str) -> str:
-    """Garante que existe <ROOT>/<Company>/<Quarter> no Drive e devolve o ID da ultima."""
-    svc = _service()
+def ensure_invoice_folder(company: str, quarter: str, subpasta: str | None = None) -> str:
+    """Garante que existe <ROOT>/<Company>/<Quarter>[/<subpasta>] no Drive e devolve o ID da ultima."""
+    partes = [company, quarter] + ([subpasta] if subpasta else [])
+    return ensure_path(partes)
+
+
+def ensure_path(partes: list[str], svc=None) -> str:
+    """Garante <ROOT>/<partes...> e devolve o ID da ultima pasta. 11-09-2026."""
+    svc = svc or _service()
     cache = _load_cache()
-
-    root_id = _ensure_folder(svc, DRIVE_ROOT_NAME, None, cache)
-    company_id = _ensure_folder(svc, company, root_id, cache)
-    quarter_id = _ensure_folder(svc, quarter, company_id, cache)
-
+    fid = _ensure_folder(svc, DRIVE_ROOT_NAME, None, cache)
+    for nome in partes:
+        fid = _ensure_folder(svc, nome, fid, cache)
     _save_cache(cache)
-    return quarter_id
+    return fid
+
+
+def list_folder(folder_id: str, svc=None) -> list[dict]:
+    """Ficheiros (nao pastas) numa pasta: id, name, mimeType, size, webViewLink."""
+    svc = svc or _service()
+    out, token = [], None
+    while True:
+        r = svc.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            spaces="drive", pageSize=200, pageToken=token,
+            fields="nextPageToken,files(id,name,mimeType,size,webViewLink,modifiedTime)",
+        ).execute()
+        out.extend(r.get("files", []))
+        token = r.get("nextPageToken")
+        if not token:
+            return out
+
+
+def folder_link(folder_id: str) -> str:
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+def upload_bytes_to(folder_id: str, data: bytes, filename: str,
+                    mime_type: str = "application/pdf", svc=None) -> dict:
+    """Upload para uma pasta conhecida, sem duplicar pelo nome."""
+    svc = svc or _service()
+    existente = svc.files().list(
+        q=("'%s' in parents and name='%s' and trashed=false"
+           % (folder_id, filename.replace("'", "\\'"))),
+        spaces="drive", fields="files(id,name,webViewLink)",
+    ).execute().get("files", [])
+    if existente:
+        return {**existente[0], "ja_existia": True}
+    media = MediaIoBaseUpload(BytesIO(data), mimetype=mime_type, resumable=False)
+    return svc.files().create(body={"name": filename, "parents": [folder_id]},
+                              media_body=media, fields="id,name,webViewLink").execute()
+
+
+def download_bytes(file_id: str, svc=None) -> bytes:
+    svc = svc or _service()
+    return svc.files().get_media(fileId=file_id).execute()
 
 
 def upload_file(
@@ -198,10 +247,25 @@ def upload_bytes(
     company: str,
     quarter: str,
     mime_type: str = "application/pdf",
+    subpasta: str | None = None,
 ) -> dict:
     """Upload directo de bytes sem passar por ficheiro local."""
     svc = _service()
-    target_folder = ensure_invoice_folder(company, quarter)
+    target_folder = ensure_invoice_folder(company, quarter, subpasta)
+
+    # Mesma verificacao que o upload_file ja fazia. Sem ela, reprocessar
+    # um email punha a mesma fatura duas vezes no Drive.
+    try:
+        existente = svc.files().list(
+            q=("'%s' in parents and name='%s' and trashed=false"
+               % (target_folder, filename.replace("'", "\\'"))),
+            spaces="drive", fields="files(id,name,webViewLink)",
+        ).execute().get("files", [])
+        if existente:
+            log.info("drive.upload_bytes_ja_existia", name=filename)
+            return existente[0]
+    except HttpError as exc:
+        log.warning("drive.check_existing_failed", err=str(exc))
 
     media = MediaIoBaseUpload(BytesIO(pdf_bytes), mimetype=mime_type, resumable=False)
     metadata = {"name": filename, "parents": [target_folder]}
