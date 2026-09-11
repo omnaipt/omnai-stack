@@ -30,6 +30,7 @@ from typing import Any
 import structlog
 
 from services.llm import generate
+from services import learned_rules_db
 
 log = structlog.get_logger()
 
@@ -47,6 +48,16 @@ Classifica cada email em UMA de 5 classes:
    * Invoices/payment confirmations with attachment
    * Confirmações de pagamento com PDF anexo
    * Mesmo que não tenha PDF anexo, se for claramente um recibo/fatura
+   NÃO é "invoice" (07-08-2026, casos reais que correram mal):
+   * Convites, lembretes e confirmações de calendário, mesmo que o evento
+     seja sobre faturação ou o produto se chame InvoiceXpress
+   * Avisos de conta e segurança: "adicionou um novo cartão", "novo início
+     de sessão", "método de pagamento actualizado". Anunciam, não entregam.
+   * Newsletters que falam de faturas, recibos ou preços sem enviar nenhum
+   * Confirmações de encomenda antes de haver documento ("Order Received")
+   * Avisos de pagamento falhado ou recusado → usa "actionable" ou "keep"
+   A pergunta certa não é "fala de dinheiro" mas "traz ou aponta para um
+   documento que o David tem de guardar".
    → Vai ser tratado pelo pipeline de arquivo automático de faturas
 
 3. "archive" — Informativo sem ser fatura, sem acção. Pode sair da inbox.
@@ -108,6 +119,76 @@ def _strip_json(text: str) -> str:
 
 
 VALID_CLASSES = {"actionable", "invoice", "archive", "delete", "keep"}
+
+# =========================================================================
+# v9.6: regras determinísticas pré-LLM (evita falsos positivos de invoice)
+# =========================================================================
+
+# v9.6.1: keywords que FORCAM invoice (override blacklists)
+_FORCE_RULES_INVOICE_KEYWORDS = [
+    re.compile(r"\bfactura[-\s]?recibo\b", re.I),
+    re.compile(r"\bfatura[-\s]?recibo\b", re.I),
+    re.compile(r"\bsua\s+factura\b", re.I),
+    re.compile(r"\bsua\s+fatura\b", re.I),
+    re.compile(r"\bsua\s+nova\s+factura\b", re.I),
+    re.compile(r"\bnota\s+de\s+(d[ée]bito|cr[ée]dito)\b", re.I),
+    re.compile(r"\brecibo\s+verde\b", re.I),
+    re.compile(r"\brecibo\s+electr[óo]nico\b", re.I),
+    re.compile(r"\bfacture\s+n[ºo°]\b", re.I),
+    re.compile(r"\binvoice\s+attached\b", re.I),
+    re.compile(r"\bnova\s+factura\s+da\b", re.I),
+    re.compile(r"\bproof\s+of\s+payment\b", re.I),
+]
+
+_FORCE_RULES_SENDER = [
+    (re.compile(r"failed-payments?@", re.I), "actionable"),
+    (re.compile(r"upcoming-invoice\+.*@stripe\.com", re.I), "archive"),
+    (re.compile(r"payments-noreply@google\.com", re.I), "keep"),
+    (re.compile(r"no-reply@(accounts\.)?google\.com", re.I), "delete"),
+]
+
+_FORCE_RULES_SUBJECT = [
+    (re.compile(r"\b(payment|pagamento).{0,40}(unsuccessful|failed|falh|declined|recusad)", re.I), "actionable"),
+    (re.compile(r"\$\d+.*(unsuccessful|failed)", re.I), "actionable"),
+    (re.compile(r"€\d+.*(unsuccessful|failed)", re.I), "actionable"),
+    (re.compile(r"(upcoming|próxim).{0,25}(invoice|fatura)", re.I), "archive"),
+    (re.compile(r"será renovada em breve", re.I), "archive"),
+    (re.compile(r"will (be )?renew", re.I), "archive"),
+    (re.compile(r"renewal (reminder|in \d+)", re.I), "archive"),
+    (re.compile(r"validar.{0,20}identidade", re.I), "keep"),
+    (re.compile(r"verify.{0,20}identity", re.I), "keep"),
+]
+
+
+def _force_class_from_rules(subject: str, from_addr: str) -> dict | None:
+    """v9.6.1 deterministic pre-filter. Invoice keywords tem prioridade absoluta."""
+    # PRIORIDADE 1: invoice keywords no subject (override qualquer blacklist)
+    if subject:
+        for rx in _FORCE_RULES_INVOICE_KEYWORDS:
+            if rx.search(subject):
+                return {
+                    "classification": "invoice",
+                    "reason": f"force.invoice_keyword:{rx.pattern[:40]}",
+                    "confidence": 0.99,
+                }
+    if from_addr:
+        for rx, klass in _FORCE_RULES_SENDER:
+            if rx.search(from_addr):
+                return {
+                    "classification": klass,
+                    "reason": f"force.sender:{rx.pattern[:40]}",
+                    "confidence": 0.98,
+                }
+    if subject:
+        for rx, klass in _FORCE_RULES_SUBJECT:
+            if rx.search(subject):
+                return {
+                    "classification": klass,
+                    "reason": f"force.subject:{rx.pattern[:40]}",
+                    "confidence": 0.97,
+                }
+    return None
+
 
 # =========================================================================
 # Enderecos do David (usados para "direct to me" check)
@@ -240,14 +321,27 @@ _BULK_SENDER_PATTERNS = [
     r"^updates@",
 ]
 
-_INVOICE_KEYWORDS = [
-    "invoice", "fatura", "factura", "receipt", "recibo", "statement",
-    "billing", "subscription", "renovacao", "renovação", "renewal",
-    "payment received", "pagamento", "order confirmation",
+# 31-07-2026: separadas em fortes e fracas.
+# Fortes: aparecem no corpo de faturas reais e raramente em texto corrido.
+# Fracas: palavras comuns que so sao sinal quando estao no assunto ou no remetente.
+_INVOICE_KEYWORDS_FORTES = [
+    "invoice", "fatura", "factura", "receipt", "recibo",
+    "payment received", "order confirmation",
     "confirmacao de encomenda", "confirmação de encomenda",
     "amount due", "valor a pagar", "transaction confirmation",
-    "purchase confirmation", "your receipt", "your invoice", "the bill",
+    "purchase confirmation", "your receipt", "your invoice",
 ]
+_INVOICE_KEYWORDS_FRACAS = [
+    "statement", "billing", "subscription", "renovacao", "renovação",
+    "renewal", "pagamento", "the bill",
+]
+# Retrocompatibilidade: alguns sitios ainda importam a lista antiga.
+_INVOICE_KEYWORDS = _INVOICE_KEYWORDS_FORTES + _INVOICE_KEYWORDS_FRACAS
+
+# Montante monetario: uma fatura tem sempre um valor.
+_MONTANTE = re.compile(
+    r"(?:€|\beur\b|\busd\b|\$)\s*\d|\d[\d\s.,]*\s*(?:€|\beur\b)", re.IGNORECASE
+)
 
 _PROMO_SUBJECT_PATTERNS = [
     r"\b\d{1,3}\s*%\s*(off|desconto)",
@@ -329,13 +423,85 @@ def _is_bulk_sender(from_addr: str) -> bool:
     return False
 
 
-def _has_invoice_keyword(subject: str, from_addr: str, body: str = "") -> bool:
-    subj_l = (subject or "").lower()
-    fr_l = (from_addr or "").lower()
-    body_head = (body or "").lower()[:1000]
-    for kw in _INVOICE_KEYWORDS:
-        if kw in subj_l or kw in fr_l or kw in body_head:
+# --- 07-08-2026: palavras procuradas como palavras -------------------------
+# "InvoiceXpress" contem "invoice" e entrava como factura. Cada palavra leva
+# as flexoes que fazem sentido; o que vier a seguir tem de ser fronteira.
+_FLEXOES = {
+    "invoice": r"invoic(?:e|es|ing)",
+    "fatura": r"fatura(?:s|c[ãa]o|c[õo]es|ç[ãa]o|ç[õo]es)?",
+    "factura": r"factura(?:s|c[ãa]o|c[õo]es|ç[ãa]o|ç[õo]es)?",
+    "receipt": r"receipts?",
+    "recibo": r"recibos?",
+    "statement": r"statements?",
+    "billing": r"billing",
+    "subscription": r"subscriptions?",
+    "renewal": r"renewals?",
+    "pagamento": r"pagamentos?",
+}
+
+
+def _padrao_kw(kw: str):
+    corpo = _FLEXOES.get(kw)
+    if corpo is None:
+        corpo = re.escape(kw).replace(r"\ ", r"\s+")
+    return re.compile(r"(?<![\w])" + corpo + r"(?![\w])", re.IGNORECASE)
+
+
+_KW_FORTES_RX = [_padrao_kw(k) for k in _INVOICE_KEYWORDS_FORTES]
+_KW_FRACAS_RX = [_padrao_kw(k) for k in _INVOICE_KEYWORDS_FRACAS]
+
+
+# Contextos em que um email nunca e a entrega de um documento fiscal. Lista
+# curta e explicita: cada linha e um falso positivo que se viu mesmo.
+_NAO_E_DOCUMENTO = [
+    re.compile(r"@calendar\.google\.com", re.I),
+    re.compile(r"^\s*(convite|invitation|lembrete|reminder)\s*:", re.I),
+    re.compile(r"^\s*(convite|invitation)\s+(atualizado|actualizado|updated)", re.I),
+    re.compile(r"\binscri[çc][ãa]o\s+para\b.{0,80}\bconfirmada\b", re.I),
+    re.compile(r"\badicionou\s+um\s+novo\s+cart[ãa]o\b", re.I),
+    re.compile(r"\bnovo\s+in[íi]cio\s+de\s+sess[ãa]o\b|\bnew\s+sign-?in\b", re.I),
+    re.compile(r"\bconvite\s+para\s+a?\s*reuni[ãa]o\b", re.I),
+]
+
+
+def _nunca_e_documento(subject: str, from_addr: str) -> bool:
+    alvo = (subject or "") + " || " + (from_addr or "")
+    for rx in _NAO_E_DOCUMENTO:
+        if rx.search(subject or "") or rx.search(from_addr or ""):
             return True
+    return False
+
+
+def _has_invoice_keyword(subject: str, from_addr: str, body: str = "") -> bool:
+    """Assunto e remetente valem para todas as keywords.
+
+    O corpo so conta com keyword FORTE mais um montante monetario. Sem isto,
+    qualquer newsletter que mencione "recibo" ou "pagamento" era marcada como
+    fatura pela Regra -1, sem passar pelo LLM (31-07-2026).
+    """
+    # 07-08-2026: um convite de calendario ou um aviso de conta nao e a
+    # entrega de um documento, por mais palavras que tenha. Devolver False
+    # nao decide que o email e lixo: tira-lhe a certeza e deixa-o seguir
+    # para o LLM, que e quem deve decidir.
+    if _nunca_e_documento(subject, from_addr):
+        return False
+
+    subj = subject or ""
+    fr = from_addr or ""
+    for rx in _KW_FORTES_RX + _KW_FRACAS_RX:
+        if rx.search(subj) or rx.search(fr):
+            return True
+    # 07-08-2026: num envio em massa, o corpo sozinho nao decide. Era assim
+    # que a newsletter da ALP sobre leis do arrendamento entrava como
+    # factura: falava de recibos, tinha valores em euros, e o remetente era
+    # newsletter@. Quem manda mesmo um documento nomeia-o no assunto.
+    if _is_bulk_sender(from_addr):
+        return False
+    body_head = (body or "")[:1000]
+    if body_head and _MONTANTE.search(body_head):
+        for rx in _KW_FORTES_RX:
+            if rx.search(body_head):
+                return True
     return False
 
 
@@ -542,6 +708,25 @@ async def classify(
     headers: dict | None = None,
     to_addr: str = "",
 ) -> dict[str, Any]:
+    # v9.6: regras aprendidas (DB) primeiro
+    learned = learned_rules_db.check(subject, from_addr)
+    if learned is not None:
+        cls, rule_id = learned
+        try:
+            await learned_rules_db.record_hit(rule_id)
+        except Exception:
+            pass
+        log.info("classify.learned", cls=cls, rule_id=rule_id, from_=from_addr[:40])
+        return {"classification": cls, "reason": f"learned_rule:{rule_id[:8]}", "confidence": 0.99}
+    forced = _force_class_from_rules(subject, from_addr)
+    if forced is not None:
+        log.info(
+            "classify.forced",
+            cls=forced["classification"],
+            reason=forced.get("reason"),
+            from_=from_addr[:40],
+        )
+        return forced
     heur = heuristic_classify(from_addr, subject, body, headers, to_addr)
     if heur is not None:
         log.info(

@@ -178,7 +178,12 @@ async def _emitir_cards_manual(manual: list) -> int:
         from_addr = (obj.get("from") or "").strip()
         inbox = (obj.get("inbox") or "").strip()
         url = obj.get("url") or None
-        chave_id = subject or from_addr or inbox or "manual-fatura"
+        # 07-08-2026: pelo assunto, "Order Received" e "Order Finished" da
+        # mesma encomenda davam dois cartoes. Agrupa-se pela encomenda.
+        from services.referencia_compra import chave_compra
+        chave_id = chave_compra(
+            subject, from_addr,
+            fallback=subject or from_addr or inbox or "manual-fatura")
         empresa = _normalizar_empresa(obj.get("company"))
         if not is_alerta_relevante(tipo=TIPO_MANUAL, empresa=empresa):
             skipped_fora_escopo += 1

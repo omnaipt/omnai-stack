@@ -39,6 +39,70 @@ log = structlog.get_logger()
 _stdlog = logging.getLogger(__name__)
 
 
+# --- 01-08-2026: lapide anti-ressurreicao -----------------------------
+import re as _re
+
+_PREFIXOS_RESP = _re.compile(
+    r"^(?:\s*(?:re|rv|res|rif|fw|fwd|enc|tr)\s*:\s*)+", _re.I)
+
+
+def assunto_base(titulo: str) -> str:
+    """Assunto sem prefixos de resposta, para comparar conversas."""
+    base = _PREFIXOS_RESP.sub("", (titulo or "").strip())
+    return _re.sub(r"\s+", " ", base).strip().lower()[:120]
+
+
+# Tipos fora da familia "email" que tambem precisam de lapide. Sao os que
+# descrevem um documento por tratar: se o David ja disse que esta tratado,
+# nao volta, venha a chave de onde vier.
+_TIPOS_COM_LAPIDE = (
+    "fatura_sem_documento",
+    "recibo_falta",
+)
+
+
+async def _fechado_equivalente(tipo: str, titulo: str, conta: str,
+                               dias: int = 30):
+    """Devolve o estado de um cartao equivalente ja fechado, ou None.
+
+    A comparacao e feita em Python e nao em SQL de proposito: a
+    normalizacao tem de ser exactamente a mesma que a do emissor, e duas
+    implementacoes da mesma regex acabam sempre por divergir.
+    """
+    # 07-08-2026: os tipos de factura tambem precisam de lapide. Mudar o
+    # esquema de chaves orfana o cartao antigo e cria um novo, e sem isto
+    # uma decisao ja tomada volta a aparecer como se fosse trabalho novo.
+    if tipo.startswith("email"):
+        filtro_tipo = "tipo LIKE 'email%'"
+    elif tipo in _TIPOS_COM_LAPIDE:
+        filtro_tipo = "tipo = $3"
+    else:
+        return None
+    alvo = assunto_base(titulo)
+    if not alvo:
+        return None
+    from services.briefing_db import _get_pool
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        linhas = await conn.fetch(
+            """
+            SELECT titulo, status, resolvido_em
+              FROM briefing_items
+             WHERE status IN ('done', 'dismissed')
+               AND """ + filtro_tipo + """
+               AND resolvido_em > now() - ($1 || ' days')::interval
+               AND ($2 = '' OR coalesce(metadata->>'account', '') = $2)
+             ORDER BY resolvido_em DESC
+             LIMIT 400
+            """,
+            str(dias), conta or "", tipo,
+        )
+    for l in linhas:
+        if assunto_base(l["titulo"]) == alvo:
+            return l["status"]
+    return None
+
+
 URGENCIAS_VALIDAS = ("P0", "P1", "P2", "P3")
 
 
@@ -83,7 +147,23 @@ async def emit_briefing(
 
     chave = make_chave(tipo, *(str(p) for p in chave_parts))
 
+    # Se esta chave ainda nao existe, isto vai ser linha nova. Antes de a
+    # criar, confirma-se que o David nao fechou ja este mesmo assunto.
+    estado_lapide = None
+    try:
+        from services.briefing_db import _get_pool as _pool_lapide
+        _p = await _pool_lapide()
+        async with _p.acquire() as _c:
+            _ja = await _c.fetchval(
+                "SELECT status FROM briefing_items WHERE chave = $1", chave)
+        if _ja is None:
+            estado_lapide = await _fechado_equivalente(
+                tipo, titulo, (metadata or {}).get("account") or "")
+    except Exception as exc:
+        log.warning("emit_briefing.lapide_falhou", tipo=tipo, err=str(exc))
+
     meta: dict[str, Any] = dict(metadata or {})
+    meta["assunto_base"] = assunto_base(titulo)
     meta["_emitter"] = {
         "worker": worker_name or "unknown",
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -102,6 +182,16 @@ async def emit_briefing(
 
     try:
         item_id = await upsert_item(item)
+        if item_id and estado_lapide:
+            from services.briefing_db import _get_pool as _pool_fecho
+            _pf = await _pool_fecho()
+            async with _pf.acquire() as _cf:
+                await _cf.execute(
+                    "UPDATE briefing_items SET status = $2, resolvido_em = now() "
+                    "WHERE id = $1::uuid AND status = 'open'",
+                    item_id, estado_lapide)
+            log.info("emit_briefing.ressurreicao_bloqueada", tipo=tipo,
+                     titulo=titulo[:70], estado=estado_lapide)
         log.info(
             "emit_briefing.ok",
             worker=worker_name,

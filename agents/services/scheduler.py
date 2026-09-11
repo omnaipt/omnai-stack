@@ -25,6 +25,55 @@ SCHEDULES_FILE = Path(os.getenv("SCHEDULES_FILE", "/app/schedules/schedules.json
 _scheduler: AsyncIOScheduler | None = None
 
 
+# --- 07-08-2026: traducao do dia da semana ---------------------------------
+# cron classico: 0=domingo ... 6=sabado (e 7 tambem e domingo)
+# APScheduler:   0=segunda ... 6=domingo
+# Sem traduzir, tudo corria um dia depois do que estava escrito.
+_DIAS_CRON = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+_ORDEM_APS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _traduzir_dow(campo: str) -> str:
+    """Converte o dia da semana do cron classico para nomes.
+
+    Devolve o campo intacto se ja vier em nomes, ou se for '*'. Expande
+    intervalos para listas explicitas: 0-4 em cron e domingo a quinta, que
+    na numeracao do APScheduler seria 6-3, um intervalo invertido que ele
+    recusa. Com a lista o problema nao existe.
+    """
+    campo = (campo or "*").strip()
+    if campo in ("*", "?", ""):
+        return "*"
+    if any(c.isalpha() for c in campo):
+        return campo  # ja vem em nomes; nao se mexe
+
+    numeros: set[int] = set()
+    for parte in campo.split(","):
+        parte = parte.strip()
+        passo = 1
+        if "/" in parte:
+            parte, p = parte.split("/", 1)
+            passo = max(1, int(p))
+        if parte in ("*", "?"):
+            ini, fim = 0, 6
+        elif "-" in parte:
+            a, b = parte.split("-", 1)
+            ini, fim = int(a) % 7, int(b) % 7
+        else:
+            ini = fim = int(parte) % 7
+        pos, i = 0, ini
+        while True:
+            if pos % passo == 0:
+                numeros.add(i)
+            if i == fim or pos > 7:
+                break
+            i = (i + 1) % 7
+            pos += 1
+
+    nomes = {_DIAS_CRON[n] for n in numeros}
+    return ",".join(d for d in _ORDEM_APS if d in nomes) or "*"
+
+
 def _parse_cron(expr: str, timezone: str) -> CronTrigger | None:
     """Converte 'min hour dom mon dow' em CronTrigger APScheduler."""
     if not expr:
@@ -34,13 +83,16 @@ def _parse_cron(expr: str, timezone: str) -> CronTrigger | None:
         log.warning("cron expression invalida: %r", expr)
         return None
     minute, hour, day, month, day_of_week = parts
+    dow = _traduzir_dow(day_of_week)
+    if dow != day_of_week:
+        log.info("cron dow traduzido: %r -> %r (expr %r)", day_of_week, dow, expr)
     try:
         return CronTrigger(
             minute=minute,
             hour=hour,
             day=day,
             month=month,
-            day_of_week=day_of_week,
+            day_of_week=dow,
             timezone=timezone or "Europe/Lisbon",
         )
     except Exception as exc:

@@ -9,7 +9,8 @@ Sprint 4.3:
     dedupe por Referencia, mark-expired, listas de activos, email rico via
     Carlos com scorecard supressivo).
   * Acrescenta emissao de cards em briefing_items via services.briefing_emit:
-      - 1 card por concurso novo (P0/P1/P2 consoante prazo).
+      - 1 card por concurso novo (entra sempre P2; escalacao diaria a P0
+        pelo briefing-inbox quando faltam <=5 dias de prazo).
       - 1 card-resumo por execucao quando ha novos.
 
 Fontes V1.2 (active):
@@ -72,27 +73,27 @@ WORKER_NAME = "scan-concursos-publicos"
 # Keywords por empresa (matching lower-case + sem acentos no objecto)
 KEYWORDS_PREVINSA = [
     # Detecção Incêndio
-    "deteccao de incendio", "sistema de incendio", "sadi",
+    "deteccao de incendio", "sistema de incendio",
     # Extinção de incêndios
     "extincao de incendio", "extincao de incendios", "combate a incendio",
     "sistema de extincao",
     # Brigadas de bombeiros
     "brigada de bombeiro", "brigadas de bombeiros", "equipa de intervencao",
     # Medidas de auto-protecção
-    "medida de autoproteccao", "medidas de autoproteccao", "map ", "plano de seguranca",
+    "medida de autoproteccao", "medidas de autoproteccao",
     "auto-proteccao", "autoproteccao",
     # Protecção florestal
-    "proteccao da floresta", "proteccao florestal", "dfci",
+    "proteccao da floresta", "proteccao florestal",
     "defesa da floresta", "defesa de floresta", "incendio rural", "incendio florestal",
     # Extintores
     "extintor", "extintores", "manutencao de extintores",
     # SCIE
-    "scie", "seguranca contra incendio", "seguranca contra incendios",
+    "seguranca contra incendio", "seguranca contra incendios",
 ]
 
 KEYWORDS_JMSOARES = [
     # CCTV
-    "cctv", "videovigilancia", "video-vigilancia", "camara de vigilancia",
+    "videovigilancia", "video-vigilancia", "camara de vigilancia",
     "camaras de vigilancia", "video vigilancia",
     # Controlo Acessos
     "controlo de acesso", "controlo de acessos", "controle de acesso",
@@ -103,11 +104,44 @@ KEYWORDS_JMSOARES = [
     "rede estruturada", "redes estruturadas", "cabecamento estruturado",
     "cablagem estruturada", "rede de dados",
     # Telecomunicações
-    "telecomunicacao", "telecomunicacoes", "itur", "ited",
+    "telecomunicacao", "telecomunicacoes",
     "infraestrutura de telecomunicacoes",
 ]
 
 STATUS_ACTIVOS = ("Novo", "Em Análise", "Proposta Submetida")
+
+# --- Acronimos: exigem fronteira de palavra (fix 31-07-2026) -----------------
+# Substring simples fazia "sadi" casar em "pasSADIcos" e "itur" em "leITURas",
+# o que enchia o P0 de obra publica e leituras de contadores.
+ACRONIMOS_PREVINSA = ["sadi", "scie", "dfci", "map", "pse", "pss"]
+ACRONIMOS_JMSOARES = ["cctv", "itur", "ited"]
+
+# Keywords demasiado genericas para bastarem sozinhas quando ha termos de veto.
+KEYWORDS_FRACAS = {
+    "telecomunicacao", "telecomunicacoes", "rede de dados",
+    "rede estruturada", "redes estruturadas",
+    "infraestrutura de telecomunicacoes",
+}
+
+# Termos que denunciam contratos de TI/obra fora do ambito das duas empresas.
+VETO_TERMOS = [
+    "data center", "datacenter", "cloud", "microsoft", "m365", "office 365",
+    "alojamento web", "licenciamento de software", "posto de trabalho informatico",
+]
+
+
+def _acronimo_presente(texto_n: str, acronimos: list[str]) -> list[str]:
+    return [a for a in acronimos if re.search(r"\b" + re.escape(a) + r"\b", texto_n)]
+
+
+def _match_empresa(texto_n: str, frases: list[str], acronimos: list[str]) -> bool:
+    hits = [k for k in frases if k in texto_n] + _acronimo_presente(texto_n, acronimos)
+    if not hits:
+        return False
+    if any(v in texto_n for v in VETO_TERMOS) and all(h in KEYWORDS_FRACAS for h in hits):
+        return False
+    return True
+
 
 HTTP_TIMEOUT = 20.0
 UA = "OMNAI-scan-concursos/1.3 (+https://agents.omnai.pt)"
@@ -618,9 +652,9 @@ async def _scrape_all() -> list[ConcursoRaw]:
 def _classify(c: ConcursoRaw) -> list[str]:
     texto_n = _norm(c.titulo + " " + c.objecto)
     empresas: list[str] = []
-    if any(k in texto_n for k in KEYWORDS_PREVINSA):
+    if _match_empresa(texto_n, KEYWORDS_PREVINSA, ACRONIMOS_PREVINSA):
         empresas.append("previnsa")
-    if any(k in texto_n for k in KEYWORDS_JMSOARES):
+    if _match_empresa(texto_n, KEYWORDS_JMSOARES, ACRONIMOS_JMSOARES):
         empresas.append("jmsoares")
     return empresas
 
@@ -813,14 +847,22 @@ def _empresa_canonica(empresa_slug: str) -> str:
 
 
 def _urgencia_pelo_prazo(prazo: date | None) -> str:
-    """P0 se prazo < 7 dias, P1 se < 21, senao P2."""
-    if prazo is None:
-        return "P2"
-    delta = (prazo - date.today()).days
-    if delta < 7:
-        return "P0"
-    if delta < 21:
-        return "P1"
+    """Urgencia a entrada e sempre P2.
+
+    Modelo novo (07-2026): os concursos entram todos como P2 e a escalacao
+    para P0 e feita diariamente pelo briefing-inbox via
+    briefing_db.escalate_concursos_by_prazo(dias=5), quando faltam <=5 dias
+    para o prazo de propostas e o concurso continua aberto. Concursos com
+    prazo vencido sao auto-expirados por expire_overdue_concursos.
+
+    Racional: o dataset dados.gov entrega concursos frequentemente ja perto
+    do prazo; o modelo antigo (P0 se <7d, P1 se <21d a entrada) enchia o
+    separador URGENTE e tirava-lhe significado. Fontes sem prazo (AcinGov,
+    Vortal, DRE) continuam P2 e nunca escalam automaticamente.
+
+    O parametro `prazo` mantem-se pela assinatura dos callers; a escalacao
+    usa metadata['prazo_propostas'] persistido no card.
+    """
     return "P2"
 
 
@@ -854,7 +896,9 @@ async def _emitir_card_concurso(
         urgencia=urgencia,
         empresa=empresa,
         chave_parts=(empresa_slug, c.referencia),
-        link_origem=link_origem,
+        # 31-07-2026: link_origem passa a ser o documento original.
+        # A pagina Notion continua guardada em metadata.notion_page_id.
+        link_origem=(c.url_original or link_origem),
         metadata={
             "referencia": c.referencia,
             "plataforma": c.plataforma,
@@ -888,7 +932,8 @@ async def _emitir_resumo_scan(
     detalhe = (
         f"Previnsa: {len(novos_prev)} novos concursos para triagem. "
         f"JMSoares: {len(novos_jms)} novos concursos para triagem. "
-        "Cards individuais P0/P1/P2 emitidos consoante prazo de propostas."
+        "Cards individuais emitidos como P2; escalacao diaria a P0 quando "
+        "faltam <=5 dias de prazo."
     )
 
     # Empresa do card-resumo: usa a que tem mais novos; em empate, OMNAI.

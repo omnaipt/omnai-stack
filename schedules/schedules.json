@@ -11,8 +11,8 @@
   {
     "taskId": "briefing-carlos",
     "description": "Briefing Carlos: gmail-multi-mcp + calendário + Notion + arquivo automático + download faturas Drive",
-    "schedule": "At 08:18 AM, Monday through Friday",
-    "cronExpression": "15 8 * * 1-5",
+    "schedule": "At 08:00 AM, every day",
+    "cronExpression": "0 8 * * *",
     "timezone": "Europe/Lisbon",
     "owner": "carlos",
     "enabled": true
@@ -132,7 +132,7 @@
     "cronExpression": "0 8 * * 1-5",
     "timezone": "Europe/Lisbon",
     "owner": "carlos",
-    "enabled": true
+    "enabled": false
   },
   {
     "taskId": "inbox-sweep-midday",
@@ -222,6 +222,42 @@
     "cronExpression": "0 4 1 * *",
     "timezone": "UTC",
     "owner": "marco",
+    "enabled": true
+  },
+  {
+    "taskId": "revolut-sync",
+    "description": "Importa movimentos Revolut Business (OMNAI) e reconcilia com o indice de faturas; dias 1-9 emite P1 com despesas do mes anterior sem fatura",
+    "schedule": "At 07:30 AM, every day",
+    "cronExpression": "30 7 * * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": true
+  },
+  {
+    "taskId": "fecho-pacote",
+    "description": "Monta o pacote mensal (facturas validadas, extrato Revolut CSV, docs Moloni, resumo) em Drive <Empresa>/Fecho/<mes> e cria rascunho de email a contabilidade na caixa OMNAI. Nunca envia.",
+    "schedule": "At 08:00 AM, on day 5 of the month",
+    "cronExpression": "0 8 5 * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": true
+  },
+  {
+    "taskId": "resposta-contabilidade",
+    "description": "Le emails recentes de @eugest.pt (texto + imagens coladas), extrai pedidos, verifica contra faturas/Revolut/Moloni e cria rascunho de resposta na thread. Nunca envia.",
+    "schedule": "At 09:15 AM, Monday through Friday",
+    "cronExpression": "15 9 * * 1-5",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": true
+  },
+  {
+    "taskId": "drive-sync",
+    "description": "Drive -> arquivo: PDFs metidos a mao em <Empresa>/<Q> entram no arquivo e na tabela faturas; fotos/PDFs na pasta Inbox sao lidos por visao, convertidos e arquivados.",
+    "schedule": "Every hour, 07:00 to 22:00",
+    "cronExpression": "0 7-22 * * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
     "enabled": true
   }
 ]

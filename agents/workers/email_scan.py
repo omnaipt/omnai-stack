@@ -1,4 +1,4 @@
-"""Worker email-scan v0.7.0 (Sprint 7.5).
+"""Worker email-scan v0.6.0 (Sprint 5).
 
 Fluxo por cada email:
   classify -> {actionable, invoice, archive, delete, keep}
@@ -11,17 +11,11 @@ Fluxo por cada email:
 
 Sprint 5: emite cards em briefing_items para itens accionaveis e faturas
 processadas/falhadas, sem mexer no resto do pipeline.
-
-Sprint 7.5: filtra cards `email_fatura_pendente` (e quaisquer outros
-contabilisticos) por responsabilidade contabilistica do David. Cards
-`email_actionable` mantem-se intocados (alertam para todas as empresas:
-sao operacionais, nao contabilisticos). O pipeline de processamento de
-fatura (push_invoice, push_manual_invoice, archive, etc.) tambem fica
-inalterado: o filtro so evita criar o CARD no briefing_items.
 """
 from __future__ import annotations
 
 import asyncio
+import re
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -32,12 +26,15 @@ from services import gmail, imap_client
 from services.briefing_emit import emit_briefing
 from services.classifier import classify, extract_email
 from services.drafter import draft_response
+from services import email_inbox_db
+from services.doc_fiscal import classificar as classificar_documento
 from services.invoices import (
     company_for_inbox,
     extract_metadata,
+    save_documento_triagem,
     save_invoice_pdf,
+    texto_pdf,
 )
-from services.responsabilidade_david import is_alerta_relevante
 from services.state import (
     push_pending_email,
     push_draft, push_invoice, push_manual_invoice, set_email_stats,
@@ -49,8 +46,6 @@ log = structlog.get_logger()
 import base64 as _b64
 
 WORKER_NAME = "email-scan"
-TIPO_ACTIONABLE = "email_actionable"  # NAO filtrado: alerta sempre
-TIPO_FATURA_PENDENTE = "email_fatura_pendente"  # filtrado por escopo David
 
 
 def _mk_pending_token(account: str, msg_id: str) -> str:
@@ -90,8 +85,9 @@ SCAN_CAP = int(os.getenv("SCAN_CAP", "50"))
 
 GMAIL_ACCOUNTS = list(gmail.GMAIL_ACCOUNTS.keys())
 IMAP_ACCOUNTS = [
-    "hello@omnai.pt",
-    "david.sardinha@omnai.pt",
+    # hello@omnai.pt saiu em 31-07-2026: e alias de david.sardinha@omnai.pt no
+    # Workspace, nao tem caixa IMAP propria. O correio chega na caixa do David.
+    # david.sardinha@omnai.pt saiu em 31-07-2026: passou para GMAIL_ACCOUNTS (OAuth).
     "david.sardinha@sapo.pt",
 ]
 VIRTUAL_ROUTES = {"david.sardinha@previnsa.com": "opaidapetinga@gmail.com"}
@@ -106,8 +102,12 @@ def _mode_policy() -> dict[str, bool]:
 
 
 def _zero_stats() -> dict[str, int]:
+    # invoice_sem_prova: emails que o classificador disse serem factura mas
+    # onde nao havia prova nenhuma de documento. Contado de proposito: uma
+    # guarda que cala coisas tem de ser vista a calar.
     return {"read": 0, "archived": 0, "deleted": 0, "pending": 0,
-            "kept": 0, "invoices": 0, "manual_invoices": 0}
+            "kept": 0, "invoices": 0, "manual_invoices": 0,
+            "invoice_sem_prova": 0}
 
 
 def _to_thread(fn, *args, **kwargs):
@@ -154,13 +154,55 @@ async def _process_invoice_gmail(account: str, summary: dict) -> tuple[bool, str
             hint_from=summary.get("from", ""),
             hint_subject=summary.get("subject", ""),
         )
+        for _tentativa in range(2):
+            if not meta.get("error"):
+                break
+            log.info("invoice.metadata_retry", tentativa=_tentativa + 1,
+                     err=meta.get("error"))
+            meta = await extract_metadata(
+                pdf_bytes,
+                hint_from=summary.get("from", ""),
+                hint_subject=summary.get("subject", ""),
+            )
+
         if meta.get("error") and not (meta.get("supplier") or meta.get("date")):
+            # O documento nunca se perde. Fica por identificar, a vista.
             log.warning("invoice.metadata_failed", err=meta.get("error"))
-            return False, f"extracção falhou: {meta.get('error')}", None
+            try:
+                await _to_thread(save_documento_triagem, pdf_bytes, meta,
+                                 account, "por_identificar", "")
+            except Exception as exc:
+                log.warning("por_identificar.save_failed", err=str(exc))
+            continue
+
+        # 03-08-2026: um aviso de corte da Aguas de Cascais tem fornecedor,
+        # data e valor como qualquer factura. So o proprio documento sabe o
+        # que e, por isso pergunta-se-lhe antes de o arquivar.
+        veredicto = classificar_documento(
+            texto_pdf(pdf_bytes), att.get("filename", ""))
+        if not veredicto["e_fatura"]:
+            try:
+                await _to_thread(
+                    save_documento_triagem, pdf_bytes, meta, account,
+                    veredicto["tipo"], veredicto.get("natureza", ""))
+            except Exception as exc:
+                log.warning("triagem.save_failed", err=str(exc))
+            log.info("invoice.nao_e_factura", tipo=veredicto["tipo"],
+                     porque=veredicto["porque"][:120],
+                     ficheiro=att.get("filename", ""))
+            continue
 
         try:
             saved = await _to_thread(save_invoice_pdf, pdf_bytes, meta, account)
         except Exception as exc:
+            from services.avarias import reportar as _avaria_save
+            await _avaria_save(
+                area="arquivo:disco",
+                titulo="Falha ao gravar uma factura no arquivo",
+                detalhe=("Um PDF classificado como factura nao foi gravado.\n\n"
+                         "Conta: %s\nErro: %s" % (account, str(exc)[:300])),
+                urgencia="P1",
+            )
             log.warning("invoice.save_failed", err=str(exc))
             return False, f"save: {exc}", None
 
@@ -250,23 +292,86 @@ async def _create_gmail_draft_for(account: str, summary: dict, reason: str) -> N
     })
 
 
-async def _emit_actionable_card(account: str, msg_id: str, subject: str, from_addr: str, reason: str) -> None:
-    """Card email_actionable: NAO filtrado por escopo de contabilidade.
+def _normalizar_data_email(valor) -> str | None:
+    """Aceita internal_date_ms (Gmail, int) ou o header Date (IMAP, str).
 
-    Sprint 7.5: este tipo continua a alertar para TODAS as empresas, porque
-    e operacional (resposta a fornecedor, decisao comercial), nao contabilistico.
+    Devolve ISO UTC ou None. Nunca levanta: uma data ilegivel nao pode
+    impedir a emissao do cartao.
     """
+    if not valor:
+        return None
+    try:
+        if isinstance(valor, (int, float)):
+            if valor <= 0:
+                return None
+            return datetime.fromtimestamp(float(valor) / 1000, tz=timezone.utc).isoformat()
+        if isinstance(valor, str) and valor.strip():
+            from email.utils import parsedate_to_datetime
+
+            dt = parsedate_to_datetime(valor.strip())
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+    return None
+
+
+_PREFIXOS_RESPOSTA = re.compile(
+    r"^(?:\s*(?:re|rv|res|rif|fw|fwd|enc|tr)\s*:\s*)+", re.IGNORECASE
+)
+
+
+def _thread_key(account: str, subject: str) -> str:
+    """Chave de conversa para contas sem threadId (IMAP).
+
+    Tira os prefixos de resposta e reencaminhamento e normaliza espacos, para
+    que "RE: Portugal" e "RV: Portugal" caiam no mesmo cartao.
+    """
+    base = _PREFIXOS_RESPOSTA.sub("", (subject or "").strip())
+    base = re.sub(r"\s+", " ", base).lower()[:120]
+    return f"{account}|{base or (subject or '')[:120]}"
+
+
+async def _emit_actionable_card(
+    account: str, msg_id: str, subject: str, from_addr: str, reason: str,
+    thread_id: str | None = None, data_email=None,
+) -> None:
     titulo = (subject or "(sem assunto)")[:180]
     detalhe = f"De: {from_addr or '(desconhecido)'}\nMotivo classificador: {reason or '-'}"
+    # 31-07-2026: um cartao por conversa. Sem isto, cada resposta de uma thread
+    # criava um cartao proprio (4 cartoes para "Re: Proposta Granter // OMNAI").
+    conversa = thread_id or _thread_key(account, subject)
+    # v9.7: persist no email_inbox para a tab Emails da PWA
+    try:
+        await email_inbox_db.upsert(
+            account=account,
+            message_id=msg_id,
+            thread_id=thread_id,
+            from_addr=from_addr or "",
+            subject=subject or "",
+            snippet=(reason or "")[:500],
+            classificacao="actionable",
+            gmail_thread_url=gmail.get_message_url(account, msg_id) if hasattr(gmail, "get_message_url") else None,
+        )
+    except Exception as exc:
+        log.warning("email_inbox.upsert_failed", err=str(exc))
     await emit_briefing(
-        tipo=TIPO_ACTIONABLE,
+        tipo="email_actionable",
         titulo=titulo,
         detalhe=detalhe,
         urgencia="P1",
         empresa=_empresa_para_card(account),
-        chave_parts=(msg_id,),
+        chave_parts=(conversa,),
         link_origem=gmail.get_message_url(account, msg_id),
         metadata={
+            "gmail_message_id": msg_id,
+            "thread_id": thread_id,
+            "conversa": conversa,
+            # 31-07-2026: data real do email, para ordenar o ecra Hoje por
+            # quem esta a espera ha mais tempo.
+            "email_date": _normalizar_data_email(data_email),
+            "gmail_inbox": account,
             "account": account,
             "from": (from_addr or "")[:200],
             "subject": (subject or "")[:200],
@@ -277,33 +382,30 @@ async def _emit_actionable_card(account: str, msg_id: str, subject: str, from_ad
 
 
 async def _emit_invoice_pendente_card(account: str, msg_id: str, subject: str, from_addr: str, reason: str, link: str) -> None:
-    """Card email_fatura_pendente: FILTRADO por escopo de contabilidade David.
+    # 07-08-2026: este emissor foi desligado. O arquivo_faturas cria o
+    # cartao, a partir da mesma fila, e passou a ser chamado no fim de cada
+    # varrimento. Antes disto o mesmo email dava dois cartoes com titulos
+    # diferentes, e a lapide nao os conseguia ligar por causa do prefixo.
+    # A funcao fica, sem corpo activo, porque os dois sitios que a chamam
+    # continuam a fazer sentido como ponto de extensao.
+    log.debug("fatura.card_delegado", account=account, msg=msg_id)
+    return
 
-    Sprint 7.5: so emite para OMNAI, Sopato e Pessoal. Para Previnsa e
-    JMSoares a fatura continua a entrar na manual_invoices queue (decisao
-    feita upstream em process_gmail/imap), mas nao gera card no briefing.
-    """
-    empresa = _empresa_para_card(account)
-    if not is_alerta_relevante(tipo=TIPO_FATURA_PENDENTE, empresa=empresa):
-        log.debug(
-            "skip emit_briefing",
-            tipo=TIPO_FATURA_PENDENTE,
-            empresa=empresa,
-            account=account,
-            reason="fora_responsabilidade_david",
-        )
-        return
     titulo = f"Fatura por extrair: {subject or '(sem assunto)'}"[:180]
     detalhe = f"De: {from_addr or '(desconhecido)'}\nMotivo: {reason or '-'}"
+    from services.referencia_compra import chave_compra
+    _chave = chave_compra(subject, from_addr, fallback=msg_id)
     await emit_briefing(
-        tipo=TIPO_FATURA_PENDENTE,
+        tipo="email_fatura_pendente",
         titulo=titulo,
         detalhe=detalhe,
         urgencia="P1",
-        empresa=empresa,
-        chave_parts=(msg_id, "fatura"),
+        empresa=_empresa_para_card(account),
+        chave_parts=(_chave, "fatura"),
         link_origem=link or gmail.get_message_url(account, msg_id),
         metadata={
+            "gmail_message_id": msg_id,
+            "gmail_inbox": account,
             "account": account,
             "from": (from_addr or "")[:200],
             "subject": (subject or "")[:200],
@@ -319,11 +421,29 @@ async def process_gmail(account: str) -> dict[str, Any]:
     sample: list[dict] = []
     policy = _mode_policy()
 
+    from services.avarias import reportar as _avaria, resolvida as _avaria_ok
+
     try:
         listing = await _to_thread(gmail.list_inbox_messages, account, 24, SCAN_CAP)
     except Exception as exc:
+        # 04-08-2026: aqui devolvia-se zero e seguia-se em frente. Uma conta
+        # com o token expirado ficava a devolver zero emails durante meses e
+        # o relatorio dizia "ok". Nunca mais.
+        await _avaria(
+            area="email:" + account,
+            titulo="Caixa %s parou de ser lida" % account,
+            detalhe=("O scan de email nao conseguiu listar a caixa.\n\n"
+                     "Erro: %s\n\n"
+                     "Se disser invalid_grant, o token expirou e e preciso "
+                     "reautorizar esta conta. Enquanto isto durar, os emails "
+                     "desta caixa nao aparecem no Hoje nem geram facturas."
+                     % str(exc)[:300]),
+            urgencia="P1",
+        )
         log.warning("gmail.list_failed", account=account, err=str(exc))
-        return {**stats, "sample": sample}
+        return {**stats, "sample": sample, "falhou": True}
+
+    await _avaria_ok("email:" + account)
 
     for item in listing:
         try:
@@ -349,9 +469,13 @@ async def process_gmail(account: str) -> dict[str, Any]:
                 await _emit_actionable_card(
                     account, summary["id"],
                     summary.get("subject", ""), summary.get("from", ""), reason,
+                    thread_id=summary.get("thread_id"),
+                    data_email=summary.get("internal_date_ms") or summary.get("date"),
                 )
                 if not (SCAN_DRY_RUN or not policy["draft"]):
-                    await _create_gmail_draft_for(account, summary, reason)
+                    # v9.7: draft on-demand via PWA, nao gerado automaticamente
+
+                    log.info("draft.skipped", reason="on_demand_via_pwa", account=account)
 
             elif classification == "invoice":
                 if SCAN_DRY_RUN or not policy["invoice"]:
@@ -364,6 +488,20 @@ async def process_gmail(account: str) -> dict[str, Any]:
                         await _to_thread(gmail.archive_message, account, summary["id"])
                         stats["archived"] += 1
                 else:
+                    # 07-08-2026: antes de mandar extrair um documento, ver
+                    # se ha documento. So corre quando a extraccao falhou.
+                    from services.prova_documento import ha_prova as _prova
+                    _ok, _porque = _prova(
+                        summary.get("subject", ""), summary.get("from", ""),
+                        summary.get("body", "") or summary.get("snippet", ""),
+                        summary.get("attachments"))
+                    if not _ok:
+                        stats["invoice_sem_prova"] = stats.get("invoice_sem_prova", 0) + 1
+                        log.info("invoice.sem_prova", account=account,
+                                 subject=(summary.get("subject", "") or "")[:90],
+                                 de=(summary.get("from", "") or "")[:60],
+                                 porque=_porque)
+                        continue
                     stats["manual_invoices"] += 1
                     msg_url = gmail.get_message_url(account, summary["id"])
                     await push_manual_invoice({
@@ -439,6 +577,7 @@ async def process_imap(account: str) -> dict[str, Any]:
                 await _emit_actionable_card(
                     account, m["id"],
                     m.get("subject", ""), m.get("from", ""), reason,
+                    data_email=m.get("date"),
                 )
                 if not (SCAN_DRY_RUN or not policy["draft"]):
                     try:
@@ -470,6 +609,18 @@ async def process_imap(account: str) -> dict[str, Any]:
                         await _to_thread(imap_client.archive_message, account, m["id"])
                         stats["archived"] += 1
                 else:
+                    from services.prova_documento import ha_prova as _prova_i
+                    _ok, _porque = _prova_i(
+                        m.get("subject", ""), m.get("from", ""),
+                        m.get("body", "") or body or "",
+                        m.get("attachments"))
+                    if not _ok:
+                        stats["invoice_sem_prova"] = stats.get("invoice_sem_prova", 0) + 1
+                        log.info("invoice.sem_prova", account=account,
+                                 subject=(m.get("subject", "") or "")[:90],
+                                 de=(m.get("from", "") or "")[:60],
+                                 porque=_porque)
+                        continue
                     stats["manual_invoices"] += 1
                     await push_manual_invoice({
                         "inbox": account,
@@ -534,18 +685,101 @@ async def run() -> dict[str, Any]:
     await set_email_stats("david.sardinha@jmsoares.pt", _zero_stats())
     results["david.sardinha@jmsoares.pt"] = {**_zero_stats(), "note": "sem integracao"}
 
+    # 03-08-2026: sem isto, o ecra Faturas fica congelado no dia em que
+    # alguem correu o indice a mao. Foi o que aconteceu entre 31/07 e hoje.
+    indice = {}
+    try:
+        from services.faturas_index import indexar
+        indice = await indexar()
+        if indice.get("novos"):
+            log.info("faturas.indexadas", **indice)
+    except Exception as exc:
+        try:
+            from services.avarias import reportar as _avaria_idx
+            await _avaria_idx(
+                area="faturas:indice",
+                titulo="Indice de facturas parou de actualizar",
+                detalhe=("As facturas continuam a ser arquivadas em disco, mas "
+                         "deixaram de aparecer no ecra Facturas.\n\nErro: %s"
+                         % str(exc)[:300]),
+                urgencia="P1",
+            )
+        except Exception:
+            pass
+        log.warning("faturas.index_falhou", err=str(exc))
+
+    # 07-08-2026: os cartoes de factura por tratar passam a nascer aqui, no
+    # fim do varrimento, em vez de nascerem duas vezes: uma no email_scan e
+    # outra no arquivo_faturas dias depois. Um facto, um emissor.
+    try:
+        from services.state import peek_manual_invoices as _fila
+        from workers.arquivo_faturas import _emitir_cards_manual as _emitir
+        _pendentes = await _fila()
+        if _pendentes:
+            _n = await _emitir(_pendentes)
+            log.info("faturas.cards_manuais", fila=len(_pendentes), cards=_n)
+    except Exception as exc:
+        try:
+            from services.avarias import reportar as _avaria_cards
+            await _avaria_cards(
+                area="faturas:cards",
+                titulo="Facturas por extrair deixaram de aparecer no Hoje",
+                detalhe=("O varrimento correu, mas os cartoes das facturas "
+                         "sem PDF nao foram criados. Ficam na fila e so "
+                         "aparecem quando o arquivo-faturas correr.\n\n"
+                         "Erro: %s" % str(exc)[:300]),
+                urgencia="P1",
+            )
+        except Exception:
+            pass
+        log.warning("faturas.cards_manuais_falhou", err=str(exc))
+
+    # O arquivo no Drive falhava em silencio. Passa a dar cartao no Hoje.
+    try:
+        from services.vigia_drive import verificar as vigiar_drive
+        await vigiar_drive()
+    except Exception as exc:
+        log.warning("vigia_drive.falhou", err=str(exc))
+
     keys = ("read", "archived", "deleted", "pending", "kept", "invoices", "manual_invoices")
     totals = {k: sum(r.get(k, 0) for r in results.values() if isinstance(r, dict)) for k in keys}
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
 
+    # 04-08-2026: durante dois meses e meio isto devolveu "ok" com as cinco
+    # contas a falhar autenticacao. O estado agora conta a verdade.
+    contas_falhadas = [c for c, r in results.items()
+                       if isinstance(r, dict) and r.get("falhou")]
+    if contas_falhadas:
+        try:
+            from services.avarias import reportar as _avaria
+            if len(contas_falhadas) == len(results):
+                await _avaria(
+                    area="email:todas",
+                    titulo="Nenhuma caixa de email esta a ser lida",
+                    detalhe=("As %d contas falharam no mesmo varrimento: %s.\n\n"
+                             "Isto costuma ser o token de acesso, nao a rede."
+                             % (len(contas_falhadas), ", ".join(contas_falhadas))),
+                    urgencia="P0",
+                )
+        except Exception as exc:
+            log.warning("avaria.email_global_falhou", err=str(exc))
+    else:
+        try:
+            from services.avarias import resolvida as _avaria_ok
+            await _avaria_ok("email:todas")
+        except Exception:
+            pass
+
     return {
-        "status": "ok",
+        "status": "degradado" if contas_falhadas else "ok",
+        "contas_falhadas": contas_falhadas,
         "mode": SCAN_MODE,
         "dry_run": SCAN_DRY_RUN,
         "cap": SCAN_CAP,
         "accounts_processed": len(results),
         "totals": totals,
         "per_account": results,
+        "indice_faturas": indice,
         "elapsed_s": round(elapsed, 2),
         "ts": started.isoformat(),
     }

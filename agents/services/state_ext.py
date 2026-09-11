@@ -1,15 +1,14 @@
-"""Extensoes async ao services.state para funcionalidades da v9.1.
+"""Extensoes async ao services.state.
 
-Funcoes novas:
-- incr_rate_limit(domain) -> int: incrementa contador diario
-- get_content_hash / set_content_hash: para analise competitiva
-- peek_invoices_all() / peek_manual_invoices_all(): alias publico
+v9.1: incr_rate_limit, content_hash helpers, peek_archived/manual.
+Sprint 9: pop_draft_by_id (apaga draft individual de Redis pelo draft_id).
 
 Reutiliza o mesmo cliente redis de services.state._c().
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+import json
+from datetime import date
 
 from services.state import _c
 
@@ -62,3 +61,34 @@ async def peek_manual_queue() -> list[str]:
     if c is None:
         return []
     return await c.lrange("omnai:invoices:manual_queue", 0, -1)
+
+
+# ---- Sprint 9: pop draft individual ----
+
+DRAFTS_KEY = "omnai:email:drafts"
+
+
+async def pop_draft_by_id(draft_id: str) -> dict | None:
+    """Remove um draft especifico da lista de drafts em Redis.
+
+    Devolve o dict do draft removido (com gmail_message_id, account, etc.)
+    ou None se nao encontrar.
+
+    Usado pelo endpoint /actions/draft-done quando o David clica
+    [Marcado respondido] num card de draft.
+    """
+    c = _c()
+    if c is None or not draft_id:
+        return None
+    raw = await c.lrange(DRAFTS_KEY, 0, -1)
+    for item in raw:
+        try:
+            d = json.loads(item)
+        except Exception:
+            continue
+        if d.get("draft_id") == draft_id:
+            # LREM exact match: o redis-py compara byte-a-byte com o valor
+            # original retornado por LRANGE.
+            await c.lrem(DRAFTS_KEY, 1, item)
+            return d
+    return None

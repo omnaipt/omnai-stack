@@ -32,5 +32,8 @@ async def generate(
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
-    parts = [b.text for b in msg.content if hasattr(b, "text")]
+    # 31-07-2026: alguns blocos tem o atributo text mas a None, e o join
+    # rebentava com "expected str instance, NoneType found".
+    parts = [b.text for b in msg.content
+             if isinstance(getattr(b, "text", None), str)]
     return "\n".join(parts).strip()
