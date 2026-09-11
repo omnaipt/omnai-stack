@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import types
+import io
 import zlib
 from datetime import date
 from decimal import Decimal
@@ -26,7 +27,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://x")
 os.environ.setdefault("ANTHROPIC_API_KEY", "x")
 
 from services import doc_fiscal, invoices, faturas_index  # noqa: E402
-from workers import fecho_pacote, resposta_contabilidade as rc  # noqa: E402
+from workers import fecho_pacote, resposta_contabilidade as rc, drive_sync as ds  # noqa: E402
 
 
 def pdf_com_texto(texto: str) -> bytes:
@@ -246,3 +247,45 @@ def test_mcp_lists_new_tools():
     names = {t["name"] for t in mcp_server.TOOLS}
     assert {"fecho_pacote", "fecho_marcar_entregues", "resposta_contabilidade", "arquivo_verificar"} <= names
     assert set(mcp_server.HANDLERS) == names
+
+
+# ------------------------------------------------------------ drive_sync
+
+def test_drive_sync_fotos(monkeypatch):
+
+    from PIL import Image
+    meta = {"supplier": "Odessa Sushi", "date": "25/08/2026", "amount": "170,00", "currency": "EUR",
+            "invoice_number": "FT 2A2601/1137", "customer_nif": "519270592"}
+    assert ds.nome_canonico(meta) == "odessa-sushi_2026-08-25_170-00EUR_ft-2a2601-1137.pdf"
+    assert ds.nome_canonico({"supplier": None, "date": "x"}).startswith("unknown_")
+    assert ds._aviso_foto({"customer_nif": "519270592", "legivel": True}, "OMNAI") is None
+    assert "sem NIF" in ds._aviso_foto({"customer_nif": None, "tipo": "talao_sem_nif"}, "OMNAI")
+    assert "nome pessoal" in ds._aviso_foto({"customer_nif": "PT 230 791 611"}, "OMNAI")
+    assert "nao e o da OMNAI" in ds._aviso_foto({"customer_nif": "500000000"}, "OMNAI")
+    assert ds._aviso_foto({"customer_nif": None}, "Sopato") is None
+    # imagem -> pdf de uma pagina
+    img = Image.new("RGB", (900, 1400), (240, 240, 240))
+    buf = io.BytesIO(); img.save(buf, format="JPEG")
+    pdf = ds.imagem_para_pdf(buf.getvalue())
+    assert pdf[:4] == b"%PDF"
+    from pypdf import PdfReader
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 1
+    # visao com resposta simulada
+    import services.visao as visao
+
+    async def fake(system, prompt, imagens, max_tokens=2000, model=None):
+        assert imagens[0][1] == "image/jpeg"
+        return '{"e_documento_fiscal": true, "tipo": "fatura", "supplier": "Indigo", "date": "12/08/2026", "amount": "70,00", "currency": "EUR", "invoice_number": "FS 1/77", "customer_nif": "519270592", "legivel": true}'
+
+    monkeypatch.setattr(visao, "generate_multimodal", fake)
+    m = asyncio.run(ds.ler_foto(buf.getvalue()))
+    assert m["date"] == "2026-08-12" and m["amount"] == 70.0 and ds._trimestre(m) == "2026-Q3"
+    # gravacao local com hash: segunda vez devolve o mesmo caminho
+    rel1 = ds._gravar_local(Path("OMNAI/2026-Q3"), "indigo_2026-08-12_70-00EUR_fs-1-77.pdf", pdf)
+    rel2 = ds._gravar_local(Path("OMNAI/2026-Q3"), "outro_nome.pdf", pdf)
+    assert rel1 == rel2 == "OMNAI/2026-Q3/indigo_2026-08-12_70-00EUR_fs-1-77.pdf"
+
+
+def test_mcp_has_drive_sync():
+    import mcp_server
+    assert "drive_sync" in mcp_server.HANDLERS and any(t["name"] == "drive_sync" for t in mcp_server.TOOLS)

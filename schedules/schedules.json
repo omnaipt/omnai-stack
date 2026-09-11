@@ -250,5 +250,14 @@
     "timezone": "Europe/Lisbon",
     "owner": "ana",
     "enabled": true
+  },
+  {
+    "taskId": "drive-sync",
+    "description": "Drive -> arquivo: PDFs metidos a mao em <Empresa>/<Q> entram no arquivo e na tabela faturas; fotos/PDFs na pasta Inbox sao lidos por visao, convertidos e arquivados.",
+    "schedule": "Every hour, 07:00 to 22:00",
+    "cronExpression": "0 7-22 * * *",
+    "timezone": "Europe/Lisbon",
+    "owner": "ana",
+    "enabled": true
   }
 ]

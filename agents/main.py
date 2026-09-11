@@ -1484,3 +1484,7 @@ from workers import fecho_pacote as _fecho_pacote  # noqa: E402
 from workers import resposta_contabilidade as _resposta_contabilidade  # noqa: E402
 WORKERS["fecho-pacote"] = _fecho_pacote.run
 WORKERS["resposta-contabilidade"] = _resposta_contabilidade.run
+
+# 11-09-2026: o Drive deixa de ser um sitio onde as facturas se perdem.
+from workers import drive_sync as _drive_sync  # noqa: E402
+WORKERS["drive-sync"] = _drive_sync.run

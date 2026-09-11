@@ -45,7 +45,7 @@ log = structlog.get_logger()
 
 router = APIRouter()
 
-SERVER_INFO = {"name": "omnai-stack", "version": "1.2.0"}
+SERVER_INFO = {"name": "omnai-stack", "version": "1.3.0"}
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 SECRETS_DIR = Path(os.getenv("SECRETS_DIR", "/secrets"))
 TOKEN_FILE = SECRETS_DIR / "mcp_token.txt"
@@ -594,6 +594,15 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "drive_sync",
+        "description": "Sincroniza o Drive com o arquivo: PDFs metidos a mao em <Empresa>/<YYYY-Qn> entram no arquivo e na "
+                       "tabela faturas (renomeados para o padrao); fotos e PDFs na pasta Inbox sao lidos (visao), "
+                       "convertidos em PDF, arquivados e movidos para Inbox/_processadas. Devolve o que fez.",
+        "inputSchema": {"type": "object", "properties": {"limite_pastas": {"type": "integer", "default": 40},
+                                                         "limite_inbox": {"type": "integer", "default": 20}},
+                        "additionalProperties": False},
+    },
+    {
         "name": "arquivo_verificar",
         "description": "Reconstroi o indice de hashes do arquivo (dedup por conteudo) e reindexa a tabela faturas "
                        "(recibos e avisos de destinatario). Devolve contagens.",
@@ -625,6 +634,11 @@ async def _t_resposta_contabilidade(a: dict) -> Any:
         return await rc.tratar_mensagem(a.get("account") or cfg["conta"], a["message_id"],
                                         cfg["empresa"], criar_rascunho=a.get("criar_rascunho", True))
     return await rc.run(criar_rascunho=a.get("criar_rascunho", True))
+
+
+async def _t_drive_sync(a: dict) -> Any:
+    from workers import drive_sync
+    return await drive_sync.run(int(a.get("limite_pastas") or 40), int(a.get("limite_inbox") or 20))
 
 
 async def _t_arquivo_verificar(_: dict) -> Any:
@@ -886,6 +900,7 @@ HANDLERS = {
     "fecho_marcar_entregues": _t_fecho_marcar_entregues,
     "resposta_contabilidade": _t_resposta_contabilidade,
     "arquivo_verificar": _t_arquivo_verificar,
+    "drive_sync": _t_drive_sync,
 }
 
 
