@@ -110,6 +110,41 @@ def test_p3_velho_arquiva_reversivel():
     assert d.accao == "arquivar"  # status muda, nao apaga
 
 
+def test_doc_contabilistico_nunca_arquiva():
+    """Documento contabilistico velho desce ate P3 mas NAO e dispensado."""
+    velho = (HOJE - timedelta(days=120)).isoformat()
+    it = _item(tipo="fatura_sem_documento", urgencia="P1", criado_em=velho,
+               actualizado_em=velho)
+    d = pr.decidir(it, HOJE)
+    assert d.urgencia_depois == "P3", d.motivo  # fica visivel em P3
+    assert d.accao != "arquivar"
+    assert "NAO arquiva" in d.motivo
+
+
+# --- deadline_contabilidade OK nao escala -----------------------------------
+def test_deadline_ok_nao_escala():
+    items = [
+        _item(id="a", tipo="deadline_contabilidade", urgencia="P0", empresa="OMNAI",
+              metadata={"year_month": "2026-10", "ok": "True"}),
+    ]
+    decs = pr.consolidar_ciclos(items, HOJE)
+    assert len(decs) == 1
+    assert decs[0].urgencia_depois == "P2", decs[0].motivo  # 0 meses em atraso
+
+
+def test_deadline_misto_so_conta_nao_ok():
+    items = [
+        _item(id="ok", tipo="deadline_contabilidade", urgencia="P0", empresa="Sopato",
+              metadata={"year_month": "2026-09", "ok": "True"}),
+        _item(id="mau", tipo="deadline_contabilidade", urgencia="P0", empresa="Sopato",
+              metadata={"year_month": "2026-10", "ok": "False"}),
+    ]
+    decs = pr.consolidar_ciclos(items, HOJE)
+    vivos = [d for d in decs if d.urgencia_depois is not None]
+    assert len(vivos) == 1
+    assert vivos[0].urgencia_depois == "P1"  # so 1 mes em atraso (o nao-OK)
+
+
 # --- 3. Deduplicacao de ciclos mensais --------------------------------------
 def test_ciclos_consolidam_num_cartao_por_empresa_tipo():
     items = [

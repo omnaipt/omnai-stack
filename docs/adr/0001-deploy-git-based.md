@@ -1,9 +1,14 @@
 # ADR 0001: Deploy do omnai-stack passa a ser git-based
 
-- Estado: proposto
+- Estado: aceite (David, 10-11-2026), com duas condições abaixo garantidas
 - Data: 2026-11-10
 - Autor: Marco (Tech Lead)
 - Contexto do trigger: BKL-157 (briefing Hoje)
+
+## Condições de aceitação (David, 10-11-2026)
+
+1. **Rollback para a tag anterior** tem de existir e estar documentado (ver "Rollback" abaixo).
+2. **`.env` e `secrets/` ficam sempre fora do Git** e nunca são tocados pelo `git reset --hard` (ver "Segredos").
 
 ## Contexto
 
@@ -48,18 +53,41 @@ Mecânica proposta:
    trabalho; produção segue a branch de produção.
 2. `/opt/omnai-stack` passa a ser um clone Git dessa branch (o `.env` e
    `secrets/` continuam fora do Git, gitignored, geridos pelo David no host).
-3. Deploy = script `scripts/deploy.sh` no host:
+3. Cada deploy cria uma **tag** `deploy-YYYYMMDD-HHMM` no commit que entra, para
+   rollback determinístico.
+4. Deploy = script `scripts/deploy.sh` no host:
    ```bash
    cd /opt/omnai-stack
-   git fetch --all
-   git reset --hard origin/<branch-producao>   # host nunca tem edicoes locais
+   git fetch --all --tags
+   PREV=$(git rev-parse HEAD)                   # guarda o anterior
+   git reset --hard origin/<branch-producao>    # host nunca tem edicoes locais
+   git tag "deploy-$(date +%Y%m%d-%H%M)"
+   echo "$PREV" > .last_deploy                   # para o rollback
    docker compose up -d --build
    docker compose logs --tail=15 agents-api
    ```
-4. Proibido `nano`/`docker cp` no host para alterar código. Qualquer fix passa
+5. Proibido `nano`/`docker cp` no host para alterar código. Qualquer fix passa
    por PR → merge na branch de produção → `deploy.sh`.
-5. Opcional fase 2: GitHub Action que faz SSH + `deploy.sh` no merge para a
+6. Opcional fase 2: GitHub Action que faz SSH + `deploy.sh` no merge para a
    branch de produção (CI-on-merge, como já existe no Palaestra).
+
+### Rollback
+
+```bash
+cd /opt/omnai-stack
+git reset --hard $(cat .last_deploy)      # ou: git reset --hard <tag anterior>
+docker compose up -d --build
+```
+`git tag -l 'deploy-*'` lista os pontos de rollback. Como `.env`/`secrets` estão
+fora do Git, o rollback só mexe em código; a configuração mantém-se.
+
+### Segredos (condição 2)
+
+`.env` e `secrets/` estão no `.gitignore` e vivem só no host (`/opt/omnai-stack`),
+geridos pelo David. O `git reset --hard` só reescreve ficheiros versionados, por
+isso **nunca** toca em `.env`/`secrets/`. A chave de serviço Supabase e tokens
+OAuth nunca entram no repo. Antes da migração, confirmar com
+`git check-ignore .env secrets/` que ambos estão ignorados.
 
 ## Consequências
 

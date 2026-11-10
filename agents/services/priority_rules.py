@@ -43,6 +43,14 @@ CONTAB_DOC_TIPOS = (
     "fatura_sem_documento", "fatura_destinatario", "recibo_falta",
     "fecho_sem_fatura", "resposta_contabilidade", "fecho_pacote",
 )
+# Documentos contabilisticos que NUNCA sao dispensados/arquivados
+# automaticamente (regra do David, 10-11-2026): so descem de prioridade; saem
+# quando o documento chega ou sao fechados a mao. Nao inclui fatura_destinatario
+# (a confirmar com o David se tambem entra).
+NO_AUTO_DISMISS_TIPOS = (
+    "fatura_sem_documento", "recibo_falta", "resposta_contabilidade",
+    "fecho_sem_fatura", "fecho_pacote",
+)
 CICLO_TIPOS = ("fecho_contabilistico", "deadline_contabilidade")
 # Tipos emitidos por workers desligados neste item (deal_stale -> worker
 # pipeline-review-semanal desligado em BKL-157). Em dry-run saem da fila.
@@ -218,8 +226,17 @@ def decidir(item: dict, today: datetime, *, cumulative: bool = False) -> Decisao
                 base.accao = "envelhecer"
             base.motivo += f"; envelhecido {niveis} nivel(is) por {a}d sem alteracao"
 
-    # 3. Arquivo de P3 velho (reversivel).
+    # 3. Arquivo de P3 velho (reversivel). EXCEPTO documentos contabilisticos,
+    # que nunca sao dispensados automaticamente: descem ate P3 e ficam la ate o
+    # documento chegar ou fecho manual.
     if urg == "P3" and a >= ARCHIVE_P3_DAYS:
+        if t in NO_AUTO_DISMISS_TIPOS:
+            base.urgencia_depois = "P3"
+            if base.accao == "manter":
+                base.accao = "envelhecer"
+            base.motivo += (f"; P3 ha {a}d mas documento contabilistico NAO "
+                            f"arquiva (fica ate documento/fecho manual)")
+            return base
         base.urgencia_depois = None
         base.accao = "arquivar"
         base.motivo += f"; P3 ha {a}d -> arquivado (reversivel)"
@@ -230,18 +247,36 @@ def decidir(item: dict, today: datetime, *, cumulative: bool = False) -> Decisao
 
 
 # --- Consolidacao dos ciclos mensais ----------------------------------------
-def _meses_atraso(items: Iterable[dict], today: datetime) -> int:
+def _ym(item: dict) -> str:
+    return _meta(item).get("year_month") or (
+        f"{_meta(item).get('ano')}-{str(_meta(item).get('mes')).zfill(2)}")
+
+
+def _mes_em_atraso(item: dict) -> bool:
+    """Um mes do ciclo esta 'em atraso'?
+
+    - fecho_contabilistico: o cartao e de abertura do ciclo; conta sempre.
+    - deadline_contabilidade: so conta se NAO estiver OK (metadata ok=False ou
+      'OK' ausente do titulo). Os 'OK' nao escalam (aprovado pelo David).
+    """
+    if item.get("tipo") == "deadline_contabilidade":
+        ok = _meta(item).get("ok")
+        ok_bool = (ok is True) or (str(ok).strip().lower() == "true") \
+            or ("ok" in str(item.get("titulo", "")).lower()
+                and "atencao" not in str(item.get("titulo", "")).lower())
+        return not ok_bool
+    return True
+
+
+def _meses_atraso(items: Iterable[dict]) -> int:
     """Quantos meses distintos (year_month) estao em atraso no grupo."""
-    yms = set()
-    for i in items:
-        ym = _meta(i).get("year_month") or f"{_meta(i).get('ano')}-{str(_meta(i).get('mes')).zfill(2)}"
-        if ym and "None" not in ym:
-            yms.add(ym)
+    yms = {_ym(i) for i in items if _mes_em_atraso(i) and "None" not in _ym(i)}
     return len(yms)
 
 
 def _urgencia_ciclo(meses: int) -> str:
-    """Prioridade do cartao consolidado sobe com a idade do mes mais antigo."""
+    """Prioridade do cartao consolidado sobe com a idade do mes mais antigo.
+    Sem meses em atraso -> P2 (informativo, nao escala)."""
     if meses >= 2:
         return "P0"
     if meses == 1:
@@ -252,9 +287,10 @@ def _urgencia_ciclo(meses: int) -> str:
 def consolidar_ciclos(items: list[dict], today: datetime) -> list[Decisao]:
     """Colapsa os cartoes de ciclo mensal num cartao vivo por (empresa, tipo).
 
-    Guarda o mais antigo de cada grupo como o cartao sobrevivente; os restantes
-    sao 'consolidar' (status mudado, nunca apagado). A urgencia do sobrevivente
-    reflecte quantos meses estao em atraso.
+    Guarda o mais antigo EM ATRASO de cada grupo como o cartao sobrevivente (ou
+    o mais antigo se nenhum estiver em atraso); os restantes sao 'consolidar'
+    (status mudado, nunca apagado). A urgencia do sobrevivente reflecte quantos
+    meses estao em atraso.
     """
     grupos: dict[tuple[str, str], list[dict]] = {}
     for i in items:
@@ -265,9 +301,11 @@ def consolidar_ciclos(items: list[dict], today: datetime) -> list[Decisao]:
 
     out: list[Decisao] = []
     for (emp, tipo), grupo in grupos.items():
-        grupo_ord = sorted(grupo, key=lambda x: anchor_dt(x) or today)
+        atrasados = sorted((i for i in grupo if _mes_em_atraso(i)),
+                           key=lambda x: anchor_dt(x) or today)
+        grupo_ord = atrasados or sorted(grupo, key=lambda x: anchor_dt(x) or today)
         sobrevivente = grupo_ord[0]
-        meses = _meses_atraso(grupo, today)
+        meses = _meses_atraso(grupo)
         urg = _urgencia_ciclo(meses)
         for i in grupo:
             d = Decisao(
