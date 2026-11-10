@@ -52,6 +52,34 @@ def test_email_com_data_passada_desce_a_p3():
     assert d.urgencia_depois == "P3", d.motivo
 
 
+def test_email_contabilista_protegido_nunca_arquiva():
+    velho = (HOJE - timedelta(days=120)).isoformat()
+    it = _item(tipo="email_actionable", urgencia="P1", criado_em=velho,
+               actualizado_em=velho,
+               metadata={"from": "Contabilista <geral@eugest.pt>",
+                         "subject": "Documentacao em falta Julho"})
+    d = pr.decidir(it, HOJE)
+    assert d.urgencia_depois == "P3", d.motivo
+    assert d.accao != "arquivar"
+    assert pr.is_protegido(it)
+
+
+def test_email_pagamento_a_5_dias_fica_p1():
+    it = _item(tipo="email_actionable", urgencia="P2",
+               metadata={"from": "x@x.com",
+                         "subject": "Pagamento IVA com guia", "reason": "pagar ate 13/11/2026"})
+    d = pr.decidir(it, HOJE)  # 13/11 esta a 3 dias
+    assert d.urgencia_depois == "P1", d.motivo
+
+
+def test_email_prospeccao_fica_p1():
+    it = _item(tipo="email_actionable", urgencia="P2",
+               metadata={"from": "novo@desconhecido.com",
+                         "subject": "Pedido de proposta para projeto"})
+    d = pr.decidir(it, HOJE)
+    assert d.urgencia_depois == "P1", d.motivo
+
+
 def test_email_marketing_nunca_p1():
     it = _item(metadata={"from": "promotion@aliexpress.com",
                          "subject": "So hoje desconto 12/11/2026"})

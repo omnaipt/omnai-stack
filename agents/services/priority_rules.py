@@ -63,9 +63,28 @@ WORKER_DESLIGADO_TIPOS = (
 # so hoje ou futuro e dentro de N dias. Datas passadas descem a P3.
 EMAIL_DEADLINE_WINDOW_DAYS = 7
 
-# Lista de remetentes prioritarios. Comparacao por substring, minusculas, no
-# campo metadata['from']. Lista inicial do David (10-11); a completar.
-PRIORITY_SENDERS: tuple[str, ...] = ("eugest.pt", "cm-mafra.pt")
+# Clientes (remetentes prioritarios): dominios de clientes -> P1. Deve vir dos
+# contactos dos CRMs (OMNAI + Previnsa); enquanto nao houver ligacao, lista
+# provisoria confirmada pelo David. Comparacao por substring em metadata['from'].
+PRIORITY_SENDERS: tuple[str, ...] = ("cm-mafra.pt",)
+
+# Contabilista: emails a pedir documentos ou pagamentos equiparam-se a
+# documentos contabilisticos protegidos (nunca dispensados; descem mas ficam).
+ACCOUNTANT_SENDERS: tuple[str, ...] = ("eugest.pt",)
+
+# Janela de contas a pagar: fatura/pedido de pagamento com data limite sobe a
+# P1 a <= N dias do prazo (regra 2c do David).
+PAYMENT_P1_WINDOW_DAYS = 5
+
+# Prospeccao: remetente pede proposta/orcamento/reuniao/contacto comercial -> P1.
+_PROSPECTING_RE = re.compile(
+    r"(proposta|or[çc]amento|reuni[aã]o|marca[çc][aã]o|contacto\s+comercial|"
+    r"pedido\s+de\s+contacto|or[çc]ar|cota[çc][aã]o|quote|proposal|meeting)", re.I)
+
+# Pedido de pagamento / fatura (contas a pagar).
+_PAYMENT_RE = re.compile(
+    r"(pagamento|pagar|fatura|factura|iva\b|iuc\b|guia|aven[çc]a|"
+    r"valores\s+em\s+aberto|por\s+pagar|d[ée]bito|invoice)", re.I)
 
 # Marketing / promocoes: nunca justificam P1 (bloqueio por padrao, nao 1 a 1).
 _MARKETING_FROM_RE = re.compile(
@@ -75,16 +94,17 @@ _MARKETING_SUBJ_RE = re.compile(
     r"(unsubscribe|desconto|subscription|renew(ed|al)?|renov(ar|a[çc][aã]o)|"
     r"promo[cç][aã]o|sale\b|off\b|cup[aã]o|voucher|descont)", re.I)
 
-# Extraccao de datas: dd/mm[/aaaa] e "dd de <mes> de aaaa".
+# Extraccao de datas: dd/mm[/aaaa] e "dd [de] <mes>[.] [de] aaaa" (mes por
+# extenso ou abreviado, com ou sem "de"/ponto, como nos convites de calendario).
 _DATE_NUM_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b")
-_MESES_PT = {
-    "janeiro": 1, "fevereiro": 2, "marco": 3, "março": 3, "abril": 4,
-    "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
-    "outubro": 10, "novembro": 11, "dezembro": 12,
+_MES_NUM = {
+    "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
+    "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
 }
 _DATE_PT_RE = re.compile(
-    r"\b(\d{1,2})\s+de\s+(" + "|".join(_MESES_PT) + r")(?:\s+de\s+(\d{4}))?\b",
-    re.I)
+    r"\b(\d{1,2})\s+(?:de\s+)?"
+    r"(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[a-zç]*\.?"
+    r"(?:\s+de)?\s*(\d{4})?", re.I)
 
 
 # --- Helpers de leitura tolerante -------------------------------------------
@@ -128,7 +148,7 @@ def age_days(item: dict, today: datetime) -> int:
 def origem(item: dict) -> str:
     t = item.get("tipo", "")
     if t in EMAIL_TIPOS or t.startswith("email"):
-        return "email"
+        return "email_protegido" if is_protegido(item) else "email"
     if t in CICLO_TIPOS:
         return "ciclo_mensal"
     if t in CONTAB_DOC_TIPOS:
@@ -171,7 +191,7 @@ def _email_datas(item: dict, today: datetime) -> list[date]:
     for d, mesnome, yr in _DATE_PT_RE.findall(texto):
         try:
             ano = int(yr) if yr else today.year
-            out.append(date(ano, _MESES_PT[mesnome.lower()], int(d)))
+            out.append(date(ano, _MES_NUM[mesnome.lower()[:3]], int(d)))
         except Exception:
             pass
     return out
@@ -182,6 +202,31 @@ def _email_remetente_prioritario(item: dict) -> bool:
         return False
     frm = str(_meta(item).get("from", "")).lower()
     return any(s.lower() in frm for s in PRIORITY_SENDERS)
+
+
+def _email_contabilista(item: dict) -> bool:
+    frm = str(_meta(item).get("from", "")).lower()
+    return any(s.lower() in frm for s in ACCOUNTANT_SENDERS)
+
+
+def _email_prospeccao(item: dict) -> bool:
+    return bool(_PROSPECTING_RE.search(_email_texto(item)))
+
+
+def _email_pedido_pagamento(item: dict) -> bool:
+    return bool(_PAYMENT_RE.search(_email_texto(item)))
+
+
+def is_protegido(item: dict) -> bool:
+    """Item que nunca e dispensado automaticamente: so desce de prioridade e
+    sai quando resolvido a mao. Documentos contabilisticos, emails do
+    contabilista, e pedidos de pagamento/fatura."""
+    t = item.get("tipo", "")
+    if t in NO_AUTO_DISMISS_TIPOS:
+        return True
+    if t in EMAIL_TIPOS or t.startswith("email"):
+        return _email_contabilista(item) or _email_pedido_pagamento(item)
+    return False
 
 
 def _dias_para_prazo_contabilistico(today: datetime) -> int:
@@ -222,16 +267,32 @@ def _base_reclassify(item: dict, today: datetime) -> tuple[str, str]:
         if _email_marketing(item):
             return "P2", "email marketing/promocao -> P2 (bloqueado de P1)"
         datas = _email_datas(item, today)
-        if datas:
-            limite = today.date() + timedelta(days=EMAIL_DEADLINE_WINDOW_DAYS)
-            if any(today.date() <= dt <= limite for dt in datas):
-                return "P1", "email com data dentro de 7 dias"
-            if any(dt < today.date() for dt in datas):
-                return "P3", "email com data ja passada -> P3 (envelhece)"
-            return "P2", "email com data futura a mais de 7 dias -> P2"
+        futuras = [dt for dt in datas if dt >= today.date()]
+
+        # (2c + contabilista) contas a pagar / contabilista: PROTEGIDO.
+        # Sobe a P1 a <=5 dias do prazo; senao fica P2 (mas nunca dispensado).
+        if _email_contabilista(item) or _email_pedido_pagamento(item):
+            jp = today.date() + timedelta(days=PAYMENT_P1_WINDOW_DAYS)
+            if futuras and any(today.date() <= dt <= jp for dt in futuras):
+                return "P1", "pagamento/contabilista a <=5 dias do prazo (protegido)"
+            return "P2", "pagamento/contabilista protegido (sem prazo iminente) -> P2"
+
+        # Data util: hoje..+7d -> P1 (prazo iminente ganha sempre). Data so
+        # passada -> P3 (evento ja aconteceu; ganha a prospeccao/remetente).
+        limite = today.date() + timedelta(days=EMAIL_DEADLINE_WINDOW_DAYS)
+        if datas and any(today.date() <= dt <= limite for dt in datas):
+            return "P1", "email com data dentro de 7 dias"
+        if datas and not futuras:
+            return "P3", "email com data ja passada -> P3 (envelhece)"
+
+        # (2b) prospeccao comercial de remetente -> P1.
+        if _email_prospeccao(item):
+            return "P1", "prospeccao (proposta/orcamento/reuniao/contacto) -> P1"
+
+        # (2a) cliente (dominio prioritario) -> P1.
         if _email_remetente_prioritario(item):
-            return "P1", "email de remetente prioritario"
-        return "P2", "email sem data util nem remetente prioritario -> P2"
+            return "P1", "email de cliente (remetente prioritario)"
+        return "P2", "email sem sinal util -> P2"
 
     if t in CONTAB_DOC_TIPOS:
         dias = _dias_para_prazo_contabilistico(today)
@@ -283,12 +344,12 @@ def decidir(item: dict, today: datetime, *, cumulative: bool = False) -> Decisao
     # que nunca sao dispensados automaticamente: descem ate P3 e ficam la ate o
     # documento chegar ou fecho manual.
     if urg == "P3" and a >= ARCHIVE_P3_DAYS:
-        if t in NO_AUTO_DISMISS_TIPOS:
+        if is_protegido(item):
             base.urgencia_depois = "P3"
             if base.accao == "manter":
                 base.accao = "envelhecer"
-            base.motivo += (f"; P3 ha {a}d mas documento contabilistico NAO "
-                            f"arquiva (fica ate documento/fecho manual)")
+            base.motivo += (f"; P3 ha {a}d mas item protegido NAO arquiva "
+                            f"(fica ate documento/pagamento/fecho manual)")
             return base
         base.urgencia_depois = None
         base.accao = "arquivar"
