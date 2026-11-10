@@ -69,7 +69,9 @@
     "cronExpression": "0 9 * * 1",
     "timezone": "Europe/Lisbon",
     "owner": "tiago",
-    "enabled": true
+    "enabled": false,
+    "disabled_reason": "BKL-157 (10-11-2026): le da base Notion 'Pipeline Comercial' (6db8052e-4e52-4099-bff6-0b21c50b8396), abandonada; a informacao comercial vive no CRM da OMNAI. Gerava ~22 cards deal_stale P1 de ruido. Reativar: por 'enabled': true (e remover crontab/n8n se tambem desligados). Decisao de repointar ao CRM em item separado do Backlog Produto.",
+    "disabled_ref": "BKL-157"
   },
   {
     "taskId": "check-deadlines-legais",

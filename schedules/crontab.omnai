@@ -31,8 +31,8 @@ MAILTO=""
 # analise-concorrencia-semanal       - Seg 09:01
 0  9  * * 1    omnai curl -fsS -X POST http://localhost/tasks/run/analise-concorrencia-semanal -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
 
-# pipeline-review-semanal            - Seg 09:04
-0  9  * * 1    omnai curl -fsS -X POST http://localhost/tasks/run/pipeline-review-semanal -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
+# pipeline-review-semanal            - Seg 09:04  [DESLIGADO BKL-157 10-11-2026: le base Notion abandonada; reativar = descomentar + enabled:true no schedules.json]
+# 0  9  * * 1    omnai curl -fsS -X POST http://localhost/tasks/run/pipeline-review-semanal -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
 
 # check-deadlines-legais             - Qua 10:09
 0  10 * * 3    omnai curl -fsS -X POST http://localhost/tasks/run/check-deadlines-legais -H "Host: agents.omnai.pt" >> /var/log/omnai-cron.log 2>&1
