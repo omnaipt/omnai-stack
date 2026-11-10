@@ -114,6 +114,40 @@ def _to_thread(fn, *args, **kwargs):
     return asyncio.to_thread(fn, *args, **kwargs)
 
 
+async def _classify_cache(account: str, chave_msg: str | None, frm: str, subj: str,
+                          body: str, headers: dict) -> dict[str, Any]:
+    """16-10-2026: o mesmo email era reclassificado nas tres corridas diarias
+    enquanto estivesse na caixa (~0,25 M tokens por corrida). Guarda o
+    resultado 45 dias no Redis. Erros (confidence 0) nao ficam guardados."""
+    import json as _json
+    from services.state import _c as _redis
+    r = _redis() if chave_msg else None
+    chave = f"cls:v1:{account}:{chave_msg}" if chave_msg else None
+    if r is not None:
+        try:
+            v = await r.get(chave)
+            if v:
+                return _json.loads(v)
+        except Exception as exc:
+            log.warning("classify.cache_ler_falhou", err=str(exc))
+    cls = await classify(frm, subj, body, headers=headers, to_addr=account)
+    if r is not None and float(cls.get("confidence") or 0) > 0:
+        try:
+            await r.set(chave, _json.dumps(cls, ensure_ascii=False), ex=45 * 86400)
+        except Exception as exc:
+            log.warning("classify.cache_gravar_falhou", err=str(exc))
+    return cls
+
+
+def _imap_msg_id(m: dict) -> str | None:
+    h = m.get("headers") or {}
+    for k in ("message_id", "Message-ID", "Message-Id", "message-id"):
+        v = m.get(k) or (h.get(k) if isinstance(h, dict) else None)
+        if v:
+            return str(v).strip()
+    return None
+
+
 def _empresa_para_card(account: str) -> str:
     """Mapeia o inbox para o conjunto canonico de briefing_db.EMPRESAS.
 
@@ -452,7 +486,7 @@ async def process_gmail(account: str) -> dict[str, Any]:
                 continue
             stats["read"] += 1
 
-            cls = await classify(summary.get("from", ""), summary.get("subject", ""), summary.get("body", ""), headers=summary.get("headers") or {}, to_addr=account)
+            cls = await _classify_cache(account, summary.get("id"), summary.get("from", ""), summary.get("subject", ""), summary.get("body", ""), summary.get("headers") or {})
             classification = cls.get("classification", "keep")
             reason = cls.get("reason", "")
 
@@ -528,9 +562,14 @@ async def process_gmail(account: str) -> dict[str, Any]:
 
             elif classification == "delete":
                 is_heur = reason.startswith("heuristic.")
-                can_delete = policy["delete"] or is_heur
+                can_delete = policy["delete"]  # 16-10-2026: heuristicas deixam de apagar
                 if SCAN_DRY_RUN or not can_delete:
-                    stats["kept"] += 1
+                    # 16-10-2026: em vez de apagar, arquiva (Gmail: tira INBOX; Sapo: pasta Triagem)
+                    if not SCAN_DRY_RUN and policy["archive"]:
+                        ok = await _to_thread(gmail.archive_message, account, summary["id"])
+                        stats["archived" if ok else "kept"] += 1
+                    else:
+                        stats["kept"] += 1
                     continue
                 ok = await _to_thread(gmail.trash_message, account, summary["id"])
                 stats["deleted" if ok else "kept"] += 1
@@ -560,7 +599,7 @@ async def process_imap(account: str) -> dict[str, Any]:
             body = await _to_thread(imap_client.get_message_body, account, m["id"])
             stats["read"] += 1
 
-            cls = await classify(m.get("from", ""), m.get("subject", ""), body, headers=m.get("headers") or {}, to_addr=account)
+            cls = await _classify_cache(account, _imap_msg_id(m), m.get("from", ""), m.get("subject", ""), body, m.get("headers") or {})
             classification = cls.get("classification", "keep")
             reason = cls.get("reason", "")
 
@@ -646,9 +685,14 @@ async def process_imap(account: str) -> dict[str, Any]:
 
             elif classification == "delete":
                 is_heur = reason.startswith("heuristic.")
-                can_delete = policy["delete"] or is_heur
+                can_delete = policy["delete"]  # 16-10-2026: heuristicas deixam de apagar
                 if SCAN_DRY_RUN or not can_delete:
-                    stats["kept"] += 1
+                    # 16-10-2026: em vez de apagar, arquiva (Gmail: tira INBOX; Sapo: pasta Triagem)
+                    if not SCAN_DRY_RUN and policy["archive"]:
+                        ok = await _to_thread(imap_client.archive_message, account, m["id"])
+                        stats["archived" if ok else "kept"] += 1
+                    else:
+                        stats["kept"] += 1
                     continue
                 ok = await _to_thread(imap_client.delete_message, account, m["id"])
                 stats["deleted" if ok else "kept"] += 1
