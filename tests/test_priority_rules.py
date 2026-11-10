@@ -40,10 +40,23 @@ def test_email_sem_sinal_cai_para_p2():
     assert d.accao == "reclassificar"
 
 
-def test_email_com_prazo_fica_p1():
-    it = _item(metadata={"from": "x@x.com", "subject": "pagar ate dia 20"})
-    d = pr.decidir(it, HOJE)
+def test_email_com_data_dentro_de_7_dias_fica_p1():
+    it = _item(metadata={"from": "x@x.com", "subject": "reuniao 12/11/2026"})
+    d = pr.decidir(it, HOJE)  # hoje = 10-11; 12/11 esta a 2 dias
     assert d.urgencia_depois == "P1", d.motivo
+
+
+def test_email_com_data_passada_desce_a_p3():
+    it = _item(metadata={"from": "cm-mafra.pt", "subject": "convocatoria 28 de outubro de 2026"})
+    d = pr.decidir(it, HOJE)  # data passada, mesmo sendo remetente prioritario
+    assert d.urgencia_depois == "P3", d.motivo
+
+
+def test_email_marketing_nunca_p1():
+    it = _item(metadata={"from": "promotion@aliexpress.com",
+                         "subject": "So hoje desconto 12/11/2026"})
+    d = pr.decidir(it, HOJE)  # tem data dentro de 7d mas e marketing
+    assert d.urgencia_depois != "P1", d.motivo
 
 
 def test_email_remetente_prioritario_fica_p1(monkeypatch=None):

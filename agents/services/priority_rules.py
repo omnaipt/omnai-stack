@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 # --- Constantes afinaveis (a spec do BKL-157) -------------------------------
@@ -45,11 +45,11 @@ CONTAB_DOC_TIPOS = (
 )
 # Documentos contabilisticos que NUNCA sao dispensados/arquivados
 # automaticamente (regra do David, 10-11-2026): so descem de prioridade; saem
-# quando o documento chega ou sao fechados a mao. Nao inclui fatura_destinatario
-# (a confirmar com o David se tambem entra).
+# quando o documento chega ou sao fechados a mao. fatura_destinatario incluido
+# (confirmado 10-11: factura em nome/NIF errado, a reemitir antes do fecho).
 NO_AUTO_DISMISS_TIPOS = (
-    "fatura_sem_documento", "recibo_falta", "resposta_contabilidade",
-    "fecho_sem_fatura", "fecho_pacote",
+    "fatura_sem_documento", "fatura_destinatario", "recibo_falta",
+    "resposta_contabilidade", "fecho_sem_fatura", "fecho_pacote",
 )
 CICLO_TIPOS = ("fecho_contabilistico", "deadline_contabilidade")
 # Tipos emitidos por workers desligados neste item (deal_stale -> worker
@@ -59,14 +59,32 @@ WORKER_DESLIGADO_TIPOS = (
     "pipeline_review_semanal",
 )
 
-# Deteccao de prazo explicito no texto do email (subject/reason).
-_PRAZO_RE = re.compile(
-    r"\b(prazo|vence|venc[ei]|at[eé]\s+\d|deadline|urgente|limite|"
-    r"dia\s+\d{1,2}|\d{1,2}[/-]\d{1,2})\b", re.I)
+# Janela em que uma data extraida do email justifica P1 (David, 10-11-2026):
+# so hoje ou futuro e dentro de N dias. Datas passadas descem a P3.
+EMAIL_DEADLINE_WINDOW_DAYS = 7
 
-# Lista de remetentes prioritarios. Proposta a partir dos dados; o David afina.
-# Comparacao por substring, minusculas, no campo metadata['from'].
-PRIORITY_SENDERS: tuple[str, ...] = ()
+# Lista de remetentes prioritarios. Comparacao por substring, minusculas, no
+# campo metadata['from']. Lista inicial do David (10-11); a completar.
+PRIORITY_SENDERS: tuple[str, ...] = ("eugest.pt", "cm-mafra.pt")
+
+# Marketing / promocoes: nunca justificam P1 (bloqueio por padrao, nao 1 a 1).
+_MARKETING_FROM_RE = re.compile(
+    r"(promotion@|promo@|newsletter|no-?reply|noreply|marketing@|news@|"
+    r"mailer@|email\.|aliexpress|notacoes@)", re.I)
+_MARKETING_SUBJ_RE = re.compile(
+    r"(unsubscribe|desconto|subscription|renew(ed|al)?|renov(ar|a[çc][aã]o)|"
+    r"promo[cç][aã]o|sale\b|off\b|cup[aã]o|voucher|descont)", re.I)
+
+# Extraccao de datas: dd/mm[/aaaa] e "dd de <mes> de aaaa".
+_DATE_NUM_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b")
+_MESES_PT = {
+    "janeiro": 1, "fevereiro": 2, "marco": 3, "março": 3, "abril": 4,
+    "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+    "outubro": 10, "novembro": 11, "dezembro": 12,
+}
+_DATE_PT_RE = re.compile(
+    r"\b(\d{1,2})\s+de\s+(" + "|".join(_MESES_PT) + r")(?:\s+de\s+(\d{4}))?\b",
+    re.I)
 
 
 # --- Helpers de leitura tolerante -------------------------------------------
@@ -125,11 +143,38 @@ def origem(item: dict) -> str:
 
 
 # --- Deteccao de sinais de subida para P1 -----------------------------------
-def _email_tem_prazo(item: dict) -> bool:
+def _email_texto(item: dict) -> str:
     m = _meta(item)
-    texto = " ".join(str(m.get(k, "")) for k in ("subject", "reason"))
-    texto += " " + str(item.get("titulo", ""))
-    return bool(_PRAZO_RE.search(texto))
+    return " ".join(str(m.get(k, "")) for k in ("subject", "reason")) \
+        + " " + str(item.get("titulo", ""))
+
+
+def _email_marketing(item: dict) -> bool:
+    frm = str(_meta(item).get("from", ""))
+    subj = str(_meta(item).get("subject", "")) + " " + str(item.get("titulo", ""))
+    return bool(_MARKETING_FROM_RE.search(frm) or _MARKETING_SUBJ_RE.search(subj))
+
+
+def _email_datas(item: dict, today: datetime) -> list[date]:
+    """Datas extraidas do subject/reason/titulo. Ano em falta assume o ano de
+    hoje. Ignora valores invalidos."""
+    texto = _email_texto(item)
+    out: list[date] = []
+    for d, mth, yr in _DATE_NUM_RE.findall(texto):
+        try:
+            ano = int(yr) if yr else today.year
+            if ano < 100:
+                ano += 2000
+            out.append(date(ano, int(mth), int(d)))
+        except Exception:
+            pass
+    for d, mesnome, yr in _DATE_PT_RE.findall(texto):
+        try:
+            ano = int(yr) if yr else today.year
+            out.append(date(ano, _MESES_PT[mesnome.lower()], int(d)))
+        except Exception:
+            pass
+    return out
 
 
 def _email_remetente_prioritario(item: dict) -> bool:
@@ -174,11 +219,19 @@ def _base_reclassify(item: dict, today: datetime) -> tuple[str, str]:
     urg = item.get("urgencia", "P2")
 
     if t in EMAIL_TIPOS or t.startswith("email"):
-        if _email_tem_prazo(item):
-            return "P1", "email com prazo explicito"
+        if _email_marketing(item):
+            return "P2", "email marketing/promocao -> P2 (bloqueado de P1)"
+        datas = _email_datas(item, today)
+        if datas:
+            limite = today.date() + timedelta(days=EMAIL_DEADLINE_WINDOW_DAYS)
+            if any(today.date() <= dt <= limite for dt in datas):
+                return "P1", "email com data dentro de 7 dias"
+            if any(dt < today.date() for dt in datas):
+                return "P3", "email com data ja passada -> P3 (envelhece)"
+            return "P2", "email com data futura a mais de 7 dias -> P2"
         if _email_remetente_prioritario(item):
             return "P1", "email de remetente prioritario"
-        return "P2", "email sem prazo nem remetente prioritario -> defeito P2"
+        return "P2", "email sem data util nem remetente prioritario -> P2"
 
     if t in CONTAB_DOC_TIPOS:
         dias = _dias_para_prazo_contabilistico(today)
