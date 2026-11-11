@@ -63,10 +63,17 @@ WORKER_DESLIGADO_TIPOS = (
 # so hoje ou futuro e dentro de N dias. Datas passadas descem a P3.
 EMAIL_DEADLINE_WINDOW_DAYS = 7
 
-# Clientes (remetentes prioritarios): dominios de clientes -> P1. Deve vir dos
-# contactos dos CRMs (OMNAI + Previnsa); enquanto nao houver ligacao, lista
-# provisoria confirmada pelo David. Comparacao por substring em metadata['from'].
-PRIORITY_SENDERS: tuple[str, ...] = ("cm-mafra.pt",)
+# Clientes/prospects conhecidos (remetentes prioritarios): dominios -> P1.
+# Garante que quem ja conheco nunca cai; a regra de prospeccao continua a
+# apanhar contactos novos. Deve vir dos CRMs (OMNAI + Previnsa); lista
+# provisoria confirmada pelo David (10-11) ate a ligacao aos CRMs.
+PRIORITY_SENDERS: tuple[str, ...] = (
+    "jmsoares.pt", "caravelas.fit", "scorpusfit.com", "cm-mafra.pt",
+)
+
+# Fornecedores: nunca contam como prospeccao (sao contactos de compra, nao
+# comerciais). Descem ao defeito P2.
+SUPPLIER_SENDERS: tuple[str, ...] = ("accurex.pt",)
 
 # Contabilista: emails a pedir documentos ou pagamentos equiparam-se a
 # documentos contabilisticos protegidos (nunca dispensados; descem mas ficam).
@@ -209,7 +216,14 @@ def _email_contabilista(item: dict) -> bool:
     return any(s.lower() in frm for s in ACCOUNTANT_SENDERS)
 
 
+def _email_fornecedor(item: dict) -> bool:
+    frm = str(_meta(item).get("from", "")).lower()
+    return any(s.lower() in frm for s in SUPPLIER_SENDERS)
+
+
 def _email_prospeccao(item: dict) -> bool:
+    if _email_fornecedor(item):
+        return False  # fornecedor nao e prospeccao (contacto de compra)
     return bool(_PROSPECTING_RE.search(_email_texto(item)))
 
 

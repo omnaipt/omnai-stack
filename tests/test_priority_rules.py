@@ -80,6 +80,14 @@ def test_email_prospeccao_fica_p1():
     assert d.urgencia_depois == "P1", d.motivo
 
 
+def test_email_fornecedor_nao_e_prospeccao():
+    it = _item(tipo="email_actionable", urgencia="P1",
+               metadata={"from": "Accurex <geral@accurex.pt>",
+                         "subject": "Pedido de contacto Omnai"})
+    d = pr.decidir(it, HOJE)
+    assert d.urgencia_depois != "P1", d.motivo  # fornecedor, nao prospeccao
+
+
 def test_email_marketing_nunca_p1():
     it = _item(metadata={"from": "promotion@aliexpress.com",
                          "subject": "So hoje desconto 12/11/2026"})
